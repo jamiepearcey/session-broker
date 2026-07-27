@@ -63,9 +63,13 @@ Milestones are defined in
       binaries + console bundle with checksums, mock-idp deliberately excluded.
       `dependabot.yml` — grouped weekly cargo/npm, monthly actions.
 
-      Adding the contract job found the spec was **invalid**: `nullable: true`
-      is OpenAPI 3.0 syntax in a file declaring 3.1, and several inline flow
-      mappings had unquoted commas that YAML read as extra keys. Both fixed.
+      Three real bugs surfaced on the first runs and are fixed: the OpenAPI
+      spec was **invalid** (3.0's `nullable: true` in a 3.1 file, plus unquoted
+      commas in inline flow mappings); `react-sdk` tests built fixtures with
+      Node's `Buffer` in a browser package (now `btoa`/`TextEncoder`, mirroring
+      how `meta.ts` decodes); and the console/demo Vite configs used Node APIs
+      without declaring `@types/node` (declared — a Vite config really does run
+      in Node, which is the opposite call to the `Buffer` one).
 
 ## Next
 

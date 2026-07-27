@@ -172,10 +172,25 @@ Two decisions worth knowing:
 - **`redocly.yaml`** turns off four rules as decisions with reasons, so a
   warning from that job means something.
 
-Adding the contract job immediately found `docs/openapi.yaml` was **invalid**:
-`nullable: true` is OpenAPI 3.0 syntax in a file declaring 3.1, and several
-inline flow mappings had unquoted commas that YAML parsed as extra keys. Fixed;
-it lints clean.
+**Three real bugs surfaced on the first runs**, which is the argument for the
+jobs existing:
+
+1. **`docs/openapi.yaml` was invalid.** `nullable: true` is OpenAPI 3.0 syntax
+   in a file declaring 3.1, and several inline flow mappings had unquoted commas
+   that YAML parsed as extra keys.
+2. **`react-sdk` tests used `Buffer`**, a Node global the browser package never
+   declared. It typechecked against a hoisted `@types/node` in a local store and
+   failed on a clean `--frozen-lockfile` install. Fixed by encoding the way the
+   SDK *decodes* — `btoa`/`TextEncoder` in `__tests__/base64url.ts`, mirroring
+   `meta.ts`'s `base64UrlDecode` — rather than by adding a Node typing to a
+   browser package.
+3. **The console and demo Vite configs used `node:path`/`process`/`__dirname`
+   without declaring `@types/node`.** The opposite fix to (2), for the opposite
+   reason: a Vite config genuinely runs in Node, so the typing was declared.
+   Same symptom, different bug — worth not conflating.
+
+All five jobs green on
+[PR #1](https://github.com/jamiepearcey/session-broker/pull/1).
 
 ## Known gaps that remain
 
