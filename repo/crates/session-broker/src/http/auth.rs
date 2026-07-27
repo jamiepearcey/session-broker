@@ -181,7 +181,9 @@ fn success_response(
         }
     }
 
-    let issued = state.sessions.create(sid.clone(), custody.clone(), tokens.sub.clone(), now);
+    let issued = state
+        .sessions
+        .create(sid.clone(), custody.clone(), tokens.sub.clone(), now);
 
     if let Some(sink) = &state.audit {
         sink.record(

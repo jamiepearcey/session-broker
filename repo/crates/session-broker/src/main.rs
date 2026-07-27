@@ -181,7 +181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let app = session_broker::telemetry::http::instrument_router(
-        http::router(state).layer(Extension(oidc)).layer(Extension(events.clone())),
+        http::router(state)
+            .layer(Extension(oidc))
+            .layer(Extension(events.clone())),
         "public",
         metrics.clone(),
     );

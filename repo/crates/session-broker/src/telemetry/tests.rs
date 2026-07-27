@@ -33,8 +33,14 @@ fn log_format_and_rotation_reject_typos_rather_than_defaulting() {
     assert_eq!("TEXT".parse::<LogFormat>().unwrap(), LogFormat::Text);
     assert!("jsonl".parse::<LogFormat>().is_err());
 
-    assert_eq!("daily".parse::<FileRotation>().unwrap(), FileRotation::Daily);
-    assert_eq!("never".parse::<FileRotation>().unwrap(), FileRotation::Never);
+    assert_eq!(
+        "daily".parse::<FileRotation>().unwrap(),
+        FileRotation::Daily
+    );
+    assert_eq!(
+        "never".parse::<FileRotation>().unwrap(),
+        FileRotation::Never
+    );
     assert!("weekly".parse::<FileRotation>().is_err());
 }
 
@@ -94,5 +100,5 @@ fn a_verbosity_override_is_bounded_and_expires_on_its_own() {
 
     // Restoring when nothing is overridden is a no-op, not an error — two
     // operators pressing "restore now" must not produce a failure.
-    assert_eq!(control.restore().unwrap(), false);
+    assert!(!control.restore().unwrap());
 }

@@ -11,20 +11,27 @@
 // in memory only, and forgotten when the tab closes.
 
 import { useState } from "react";
-import { HeartPulse, KeyRound, ShieldCheck, Users } from "lucide-react";
+import { Activity, HeartPulse, KeyRound, ScrollText, ShieldCheck, Users } from "lucide-react";
 
 import { Keys } from "@/views/Keys";
 import { Sessions } from "@/views/Sessions";
 import { CustodyView } from "@/views/CustodyView";
+import { AuditView } from "@/views/AuditView";
+import { ObservabilityView } from "@/views/ObservabilityView";
 import { hasAdminKey, setAdminKey } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ViewId = "keys" | "sessions" | "custody";
+type ViewId = "keys" | "sessions" | "custody" | "audit" | "observability";
 
 const VIEWS = [
   { id: "keys" as const, label: "API keys", icon: KeyRound },
   { id: "sessions" as const, label: "Sessions", icon: Users },
   { id: "custody" as const, label: "Custody", icon: HeartPulse },
+  // The record, then the plumbing. An operator reaches for the trail during an
+  // incident and for the setup page once, so the trail sits closer to the rest
+  // of the live state.
+  { id: "audit" as const, label: "Audit trail", icon: ScrollText },
+  { id: "observability" as const, label: "Observability", icon: Activity },
 ];
 
 export default function App() {
@@ -81,6 +88,8 @@ export default function App() {
         {view === "keys" && <Keys />}
         {view === "sessions" && <Sessions />}
         {view === "custody" && <CustodyView />}
+        {view === "audit" && <AuditView />}
+        {view === "observability" && <ObservabilityView />}
       </main>
     </div>
   );

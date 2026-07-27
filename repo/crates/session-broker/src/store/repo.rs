@@ -724,10 +724,7 @@ pub struct AuditQuery {
     pub limit: u32,
 }
 
-pub fn list_audit(
-    conn: &Connection,
-    query: &AuditQuery,
-) -> Result<Vec<StoredAuditRow>, RepoError> {
+pub fn list_audit(conn: &Connection, query: &AuditQuery) -> Result<Vec<StoredAuditRow>, RepoError> {
     // Built as a fixed set of optional predicates with bound parameters rather
     // than string interpolation: every value here arrives from a query string.
     let mut sql = String::from(
@@ -819,11 +816,10 @@ pub struct AuditStats {
 }
 
 pub fn audit_stats(conn: &Connection) -> Result<AuditStats, RepoError> {
-    let (rows, oldest, newest): (i64, Option<i64>, Option<i64>) = conn.query_row(
-        "SELECT COUNT(*), MIN(at), MAX(at) FROM audit",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
+    let (rows, oldest, newest): (i64, Option<i64>, Option<i64>) =
+        conn.query_row("SELECT COUNT(*), MIN(at), MAX(at) FROM audit", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
     let gaps: i64 = conn.query_row(
         "SELECT COUNT(*) FROM audit WHERE action = 'audit.gap'",
         [],

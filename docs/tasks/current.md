@@ -41,15 +41,43 @@ Milestones are defined in
       console (`infrastructure/query-cache/repo/ui`): same token set, badge
       register and rail. Three views: API keys, Sessions, Custody. The admin key
       is held in memory for the tab only, never persisted.
-- [x] **OpenAPI** — `docs/openapi.yaml` (3.1), all 12 paths across the three
+- [x] **OpenAPI** — `docs/openapi.yaml` (3.1), all paths across the three
       lanes, with what each refusal MEANS rather than just its status.
+
+- [x] **Observability, both planes (ADR-0014/0015).** Diagnostics: non-blocking
+      stdout (JSON or text) plus an optional rolling file sink, hand-rolled
+      Prometheus exposition at `GET /metrics` on the internal listener, and one
+      metrics+log middleware keyed on the MATCHED route. Audit: schema v3
+      `audit` table, Tier A carried inside the same writer transaction as the
+      mutation it records, Tier B batched with a depth bound and honest
+      `audit.gap` markers, hourly retention prune (default 90 days),
+      `GET /admin/audit` with filters/cursor/NDJSON export. Console gains
+      **Audit trail** and **Observability** views, including a bounded,
+      self-expiring verbosity control. INV-12/INV-13 added.
+
+- [x] **CI/CD (GitHub Actions).** `ci.yml` — fmt/clippy/test, an MSRV check
+      against the 1.88 the manifest claims, `cargo audit` (blocking, with
+      exceptions recorded in `repo/.cargo/audit.toml` and each carrying its
+      reason), the UI workspace against a frozen lockfile, and a `redocly lint`
+      of the hand-written OpenAPI. `release.yml` — tagged linux x86_64/aarch64
+      binaries + console bundle with checksums, mock-idp deliberately excluded.
+      `dependabot.yml` — grouped weekly cargo/npm, monthly actions.
+
+      Adding the contract job found the spec was **invalid**: `nullable: true`
+      is OpenAPI 3.0 syntax in a file declaring 3.1, and several inline flow
+      mappings had unquoted commas that YAML read as extra keys. Both fixed.
 
 ## Next
 
 - [ ] **M5b ⚙** the `/proxy/*` browser lane. Deliberately deferred: the
       platform routes data traffic directly to services, which authenticate
       via `/internal/token`, so nothing needs the proxy today.
-- [ ] **M6 ⚙** reaper task, anomaly events, rate limiting
+- [ ] **M6 ⚙** reaper task, rate limiting. *(Anomaly events are now recorded:
+      superseded- and retired-generation use emit `session.anomaly` rows and
+      `broker_session_anomalies_total`. The remaining INV-6a signal — two
+      generations used concurrently from different IP prefixes — needs the
+      per-generation `client_ip_prefix` the `session.meta` column was reserved
+      for, and is not wired.)*
 - [ ] **M9 ★** race/multi-tab harness (concurrency + Playwright)
 - [ ] Browser verification of `repo/ui/` against the running broker
 
@@ -70,6 +98,24 @@ Milestones are defined in
   demo's live panel, leader promotion across real tabs, forced-race button, and
   failure-path controls have not been exercised against a running broker —
   only against mocked `fetch`/`navigator.locks` in the SDK's own tests.
+
+## Known gaps in the observability work, stated plainly
+
+- **Custody transitions are not audited yet.** `custody.degraded` / `custody.dead`
+  / `custody.revoked_upstream` are in the catalogue and the console filters for
+  them, but `keepalive.rs` does not hold an `AuditSink`, so no rows are written.
+  The status change is visible in `broker_custody{status}` and in the Custody
+  view meanwhile.
+- **`login.failed` is not emitted.** The callback's failure paths all funnel
+  through one `error_redirect` that does not carry the reason, so recording it
+  would mean threading the `OauthError` back out first.
+- **Keepalive has no metrics.** `broker_keepalive_refresh_total` and
+  `broker_keepalive_upstream_duration_seconds` are declared and rendered but
+  never observed, for the same reason: the worker holds no `Metrics`.
+- **No log-sink redaction test.** INV-12 is verified against audit rows (a real
+  test) and was checked by hand against a live log stream during verification,
+  but there is no automated test that captures the subscriber's output and greps
+  it. That is the one INV-12 claim still resting on inspection.
 
 ## Deferred
 

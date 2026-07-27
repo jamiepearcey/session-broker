@@ -55,13 +55,11 @@ pub async fn metrics(
     // One read pass for everything the store knows. A scrape that took three
     // separate reader locks would show three different instants of the same
     // system, which is how a graph ends up self-contradicting.
-    let (custody, audit_rows, audit_oldest) = internal
-        .reader
-        .with(|conn| {
-            let schedules = repo::live_custody_schedules(conn).unwrap_or_default();
-            let stats = repo::audit_stats(conn).unwrap_or_default();
-            (schedules, stats.rows, stats.oldest_at)
-        });
+    let (custody, audit_rows, audit_oldest) = internal.reader.with(|conn| {
+        let schedules = repo::live_custody_schedules(conn).unwrap_or_default();
+        let stats = repo::audit_stats(conn).unwrap_or_default();
+        (schedules, stats.rows, stats.oldest_at)
+    });
 
     let mut snapshot = GaugeSnapshot {
         sessions_live: internal.sessions.len() as u64,

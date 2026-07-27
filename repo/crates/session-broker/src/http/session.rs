@@ -197,7 +197,12 @@ fn refresh(
     // of the newest means two actors hold cookies for one session, which is
     // exactly the signal the invariant asks for.
     let before = state.sessions.resolve(&hash, now);
-    if let Resolution::Active { sid, gen_no, newest: false } = &before {
+    if let Resolution::Active {
+        sid,
+        gen_no,
+        newest: false,
+    } = &before
+    {
         state.metrics.record_anomaly("superseded_generation");
         if let Some(sink) = &state.audit {
             sink.record(

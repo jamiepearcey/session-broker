@@ -1,0 +1,39 @@
+# Lint configuration for `docs/openapi.yaml`, used by CI's `openapi` job.
+#
+# The default ruleset assumes a spec that exists to generate clients. This one
+# does not: it is hand-written because what matters about this contract is which
+# LISTENER each endpoint is on and what each refusal MEANS, neither of which a
+# generator infers. So the rules below are turned off as decisions, each with the
+# reason — not silenced to make a number go green.
+#
+# Everything else stays on, and the point of pruning the noise is that a warning
+# here should now mean something.
+
+extends:
+  - recommended
+
+rules:
+  # We generate no clients from this file, so an operationId is a second name
+  # for every endpoint that nothing reads and that can silently drift from the
+  # handler it claims to describe.
+  operation-operationId: off
+
+  # Several operations legitimately have no 4xx, and saying otherwise would be
+  # a documentation lie:
+  #   /healthz, /metrics       — liveness and a scrape; there is no client error
+  #   /auth/callback           — EVERY failure redirects to the error page with
+  #                              no session (INV-3c); a 4xx here would misdescribe
+  #                              the flow the SDK actually sees
+  #   /logout                  — idempotent by design, always 200, so a client
+  #                              retrying a logout never sees an error
+  operation-4xx-response: off
+
+  # The login and interactive-refresh entry points answer 303 and nothing else.
+  # They are navigations, not API calls.
+  operation-2xx-response: off
+
+  # `https://app.example.com` is deliberately a placeholder: the public lane is
+  # path-mounted on whatever origin the SPA already has (INV-10, ADR-0012), so
+  # there is no real hostname to put here and inventing one would imply the
+  # broker has an origin of its own.
+  no-server-example.com: off

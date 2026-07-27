@@ -16,9 +16,13 @@ Every invariant maps to at least one test. Do not break one to make a test pass.
 - **INV-9** The server never reads `broker_meta`. It is an unsigned, non-secret client hint.
 - **INV-10** Default topology is single-origin path-mount; no CORS surface exists unless subdomain mode is explicitly enabled.
 - **INV-11** `/internal/token` requires both the static broker API key and a live session token; either alone yields nothing.
+- **INV-12** No log line, audit row or metric label carries secret material: no cookie value, upstream access or refresh token, PKCE verifier, OAuth `state`/`nonce`, ID token, API key secret, token hash, full client IP, raw `User-Agent`, or raw request path. Permitted identifiers are `sid`, `sub`, `key_id`, `custody_id`, `gen_no`, a /24 or /48 IP prefix, a UA hash, and matched route patterns. Enforced by looking, not by review.
+- **INV-13** No credential is issued or revoked without an audit row committed in the SAME transaction; a store failure refuses the operation rather than performing it unrecorded. Every other audited event is best-effort and **counted**, and a dropped event produces an `audit.gap` row — the record is never silently short.
 
 ## Non-negotiables of the design
 
 - Issuing a new session cookie **never** invalidates the previous one inside the grace window. This is the product; everything else bends around it.
 - The refresh hot path never calls the upstream IdP.
 - Guarantees live server-side so the client SDK stays trivial. If a client-side fix is being considered for a correctness problem, the fix belongs on the server instead.
+- Nothing on the hot path (`/session/refresh`, `/authz`) writes to the store, including for observability. A request that changes nothing produces metrics, not history.
+- Where the audit record goes is deployment config. The console can change how loud the diagnostics are; it cannot redirect or silence the record (ADR-0015).

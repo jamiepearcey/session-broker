@@ -7,7 +7,7 @@ _Last updated: 2026-07-26_
 _Updated 2026-07-26._ **The broker boots and has been driven end to end against
 a running mock IdP.** M0–M5a are implemented and green (112 crate tests + 10 in
 `mock-idp`, clippy clean under `-D warnings`). M7 (React SDK) and M8 (demo app)
-are implemented and unit-tested in isolation (`repo/ui/`, 29 vitest tests) but
+are implemented and unit-tested in isolation (`repo/ui/`, 50 vitest tests) but
 have **not** been pointed at the running broker yet — no browser verification.
 
 ### Verified by running it, not by reading it
@@ -60,7 +60,7 @@ the access token changed underneath a browser session that never re-authenticate
   - `packages/react-sdk` (`@session-broker/react`) — `meta.ts`/`leader.ts`
     (Web-Lock-held leader election, ADR-0008)/`refresh.ts` (single-flight +
     leader timer + lazy checks)/`fetch.ts` (`brokerFetch`, 401→refresh→retry
-    once) + `<SessionProvider>`/`useSession()`. 29 vitest tests (meta
+    once) + `<SessionProvider>`/`useSession()`. 50 vitest tests (meta
     parsing, single-flight collapse, 401 retry-once, mocked-lock leader
     promotion). `pnpm typecheck`/`build`/`test` all green.
   - `apps/demo` — Vite dashboard: live meta panel, leader badge, the
@@ -101,6 +101,82 @@ the access token changed underneath a browser session that never re-authenticate
   what matters is which LISTENER each endpoint is on and what each refusal
   means, neither of which a generator infers.
 
+## Added since (2026-07-27) — observability, both planes
+
+**ADR-0014 (two planes) + ADR-0015 (the durable record).** The service had
+`tracing` to stdout and nothing else, which is below the floor now that `/authz`
+answers Envoy on every request in the platform. The split that resolves the
+latency-vs-audit tension: **diagnostics are lossy and cheap, the audit record is
+durable and bounded**, and they want different events.
+
+- **Diagnostics.** `log_format` text|json, optional rolling file sink, both
+  through `tracing-appender`'s non-blocking bounded writer — a `tracing::info!`
+  on `/authz` costs a channel send, never a `write(2)`. The broker ships nothing
+  itself; a sidecar reads stdout. Hand-rolled Prometheus text at `GET /metrics`
+  on the internal listener (~20 series, buckets from 50 µs because the refresh
+  claim is microseconds), plus one middleware recording per-request metrics keyed
+  on the **matched route pattern**, never the raw path.
+- **Audit.** Schema v3 `audit` table, `AUTOINCREMENT seq` so a prune cannot hand
+  a sequence number back out. **Tier A** rows ride the same `Command::Admin` as
+  the mutation and land in the same transaction — a key cannot exist without a
+  record of being issued, and a failed transaction refuses the operation.
+  **Tier B** is batched with a depth bound; at the bound events drop, the drop is
+  counted, and an `audit.gap` row records how many. Hourly prune, 90-day default.
+- **Nothing on the hot path writes a row.** `/authz` and `/session/refresh`
+  produce metrics only, allow and deny alike. `token.exchanged` coalesces per
+  `(key_id, sid)` per 300 s; refusals never coalesce.
+- **Console** gains **Audit trail** (filters, `seq` cursor, NDJSON export, and a
+  header that says where history starts so an empty result cannot read as
+  "nothing happened") and **Observability** (what both planes are doing, copyable
+  collector/Prometheus config, and a bounded self-expiring verbosity control).
+  The line drawn: the console can change how loud the diagnostics are, never
+  where the record goes.
+- **INV-12** (no secret material anywhere in telemetry) and **INV-13** (no
+  credential change without a committed row; drops are counted and gap-marked).
+
+### Verified by running it
+
+Broker on `:18080`/`:18090` against `mock-idp` on `:19090`:
+
+| Claim | Result |
+|---|---|
+| Full lifecycle recorded | ✅ `key.issued` → `session.created` → `token.exchanged` → `session.logged_out` |
+| A revoke matching nothing | ✅ recorded as `outcome=failure, reason=not_found`, not as a revocation |
+| Repeat token exchange | ✅ one row, not two — coalescing works |
+| Cookie / admin key / backend key in the log stream | ✅ **absent** (0 hits) |
+| Any secret in the audit rows | ✅ **absent** |
+| Verbosity: over the ceiling / unparseable filter | ✅ `duration_out_of_range` / `bad_filter`, nothing applied |
+| Verbosity change itself audited | ✅ `logging.level_changed`, both raise and restore |
+| `/metrics` under real traffic | ✅ per-lane per-route counters, custody gauges, audit counters |
+| NDJSON export | ✅ one object per line |
+
+148 crate tests green (was 112), clippy clean under `-D warnings`, console
+`typecheck` + `build` green.
+
+## Added since (2026-07-27) — CI/CD
+
+`.github/workflows/ci.yml` (fmt/clippy/test, MSRV 1.88, `cargo audit`, the UI
+workspace on a frozen lockfile, `redocly lint` of the contract),
+`release.yml` (tagged linux x86_64/aarch64 binaries + console bundle with
+checksums; `mock-idp` deliberately excluded from every artifact), and
+`dependabot.yml`. `actionlint` clean; every job's commands were run locally
+first.
+
+Two decisions worth knowing:
+
+- **`cargo audit` blocks**, and the one exception —
+  `RUSTSEC-2023-0071` (`rsa`, no fix available, reached via `openidconnect`) —
+  is recorded in `repo/.cargo/audit.toml` with the reason it does not apply: the
+  broker holds no RSA private key and only *verifies* RS256 ID tokens; the only
+  private key in the tree belongs to `mock-idp`, a dev-dependency.
+- **`redocly.yaml`** turns off four rules as decisions with reasons, so a
+  warning from that job means something.
+
+Adding the contract job immediately found `docs/openapi.yaml` was **invalid**:
+`nullable: true` is OpenAPI 3.0 syntax in a file declaring 3.1, and several
+inline flow mappings had unquoted commas that YAML parsed as extra keys. Fixed;
+it lints clean.
+
 ## Known gaps that remain
 
 - **The `/proxy/*` browser lane is not built.** ADR-0007's other half. Nothing
@@ -111,6 +187,12 @@ the access token changed underneath a browser session that never re-authenticate
   but the file grows without bound.
 - **Login transactions are still in-memory.** A restart mid-login costs one
   retry.
+- **Three catalogued audit actions are declared but not emitted**:
+  `custody.degraded`/`custody.dead`/`custody.revoked_upstream` (the keepalive
+  worker holds no `AuditSink`) and `login.failed` (the callback's failure paths
+  funnel through one `error_redirect` that does not carry the reason).
+  Keepalive's two metric families are likewise declared and rendered but never
+  observed. See `docs/tasks/current.md`.
 
 ## Not built, deliberately
 

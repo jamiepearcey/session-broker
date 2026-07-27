@@ -10,6 +10,7 @@ Read these files before making changes:
 - [.context/invariants.md](../.context/invariants.md)
 - [docs/tasks/current.md](tasks/current.md)
 - [Implementation strategy](architecture/implementation-strategy.md)
+- [Observability & the audit record](architecture/observability.md) — event catalogue, metric catalogue, redaction rules, retention, and the sidecar/Prometheus recipes
 
 ## Decisions
 
@@ -26,6 +27,8 @@ Read these files before making changes:
 - [ADR-0011: Upstream-revocation propagation policy (`kill` default) and custody health](decisions/ADR-0011-upstream-revocation-propagation-policy.md)
 - [ADR-0012: Single-origin path-mounted deployment as the default topology](decisions/ADR-0012-single-origin-path-mounted-default.md)
 - [ADR-0013: Session event stream (SSE) as a hint channel](decisions/ADR-0013-session-event-stream.md)
+- [ADR-0014: Observability is two planes — lossy diagnostics and a durable audit record](decisions/ADR-0014-observability-two-planes.md)
+- [ADR-0015: The audit record is a table in the broker's own store, kept for a bounded window and surfaced in the console](decisions/ADR-0015-durable-audit-record-with-retention.md)
 
 ## Context files
 
