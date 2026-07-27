@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { getSessionMeta, parseMetaCookie } from '../meta.js';
 import type { SessionMeta } from '../types.js';
+import { base64UrlEncode, encodeMeta } from './base64url.js';
 
 const VALID_META: SessionMeta = {
   v: 1,
@@ -13,13 +14,9 @@ const VALID_META: SessionMeta = {
   custody: 'ok',
 };
 
-function encode(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf-8').toString('base64url');
-}
-
 describe('parseMetaCookie', () => {
   it('decodes a valid meta cookie from a Cookie-header-shaped string', () => {
-    const cookieHeader = `other=1; broker_meta=${encode(VALID_META)}; another=2`;
+    const cookieHeader = `other=1; broker_meta=${encodeMeta(VALID_META)}; another=2`;
     expect(parseMetaCookie(cookieHeader)).toEqual(VALID_META);
   });
 
@@ -34,17 +31,17 @@ describe('parseMetaCookie', () => {
   });
 
   it('returns null for base64 that decodes to invalid JSON', () => {
-    const garbage = Buffer.from('not json', 'utf-8').toString('base64url');
+    const garbage = base64UrlEncode('not json');
     expect(parseMetaCookie(`broker_meta=${garbage}`)).toBeNull();
   });
 
   it('returns null for well-formed JSON missing required fields', () => {
-    const partial = encode({ v: 1, sub: 'idp-subject' });
+    const partial = encodeMeta({ v: 1, sub: 'idp-subject' });
     expect(parseMetaCookie(`broker_meta=${partial}`)).toBeNull();
   });
 
   it('returns null for an out-of-taxonomy custody value', () => {
-    const bad = encode({ ...VALID_META, custody: 'unknown' });
+    const bad = encodeMeta({ ...VALID_META, custody: 'unknown' });
     expect(parseMetaCookie(`broker_meta=${bad}`)).toBeNull();
   });
 
@@ -57,11 +54,11 @@ describe('parseMetaCookie', () => {
 
 describe('getSessionMeta', () => {
   it('reads from an injected cookie string without touching document', () => {
-    expect(getSessionMeta(`broker_meta=${encode(VALID_META)}`)).toEqual(VALID_META);
+    expect(getSessionMeta(`broker_meta=${encodeMeta(VALID_META)}`)).toEqual(VALID_META);
   });
 
   it('falls back to document.cookie when no argument is given', () => {
-    document.cookie = `broker_meta=${encode(VALID_META)}`;
+    document.cookie = `broker_meta=${encodeMeta(VALID_META)}`;
     expect(getSessionMeta()).toEqual(VALID_META);
   });
 
