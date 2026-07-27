@@ -1,0 +1,15 @@
+{
+  "name": "session-broker-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm --filter @session-broker/react test",
+    "dev": "pnpm --filter @session-broker/demo dev"
+  },
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  }
+}

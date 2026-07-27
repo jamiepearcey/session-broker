@@ -1,0 +1,246 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 225 12% 4.5%;
+    --foreground: 220 8% 92%;
+    --card: 220 8% 10%;
+    --card-foreground: 220 8% 92%;
+    --primary: 264 62% 72%;
+    --primary-foreground: 210 20% 98%;
+    --secondary: 220 8% 15%;
+    --secondary-foreground: 220 8% 88%;
+    --muted: 220 7% 16%;
+    --muted-foreground: 220 6% 62%;
+    --accent: 220 8% 18%;
+    --accent-foreground: 220 8% 92%;
+    --destructive: 0 66% 52%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 220 7% 18%;
+    --input: 220 7% 19%;
+    --ring: 264 62% 72%;
+    --radius: 0.375rem;
+
+    /* Semantic state hues (badges / stat tiles). */
+    --ok: 152 46% 46%;
+    --ok-foreground: 150 40% 92%;
+    --warn: 38 82% 55%;
+    --warn-foreground: 40 60% 96%;
+    --info: 210 70% 62%;
+    --info-foreground: 210 60% 96%;
+
+    --surface-app: 225 12% 4.5%;
+    --surface-sidebar: 225 8% 8%;
+    --surface-panel: 225 8% 9.5%;
+    --surface-header: 225 8% 14%;
+    --surface-toolbar: 225 7% 12.5%;
+    --surface-input: 225 10% 6.5%;
+    --surface-hover: 225 7% 13%;
+    --surface-active: 225 7% 17%;
+    /* Callout surfaces. Opaque rather than an alpha wash: `bg-warn/20` over a
+       4.5%-lightness app surface composites to ~14% lightness — a brown stain,
+       not an amber panel. These carry the hue at a lightness that actually
+       reads, while staying dark enough for `--foreground` text to sit on. */
+    --surface-warn: 38 40% 26%;
+    --surface-danger: 358 34% 26%;
+    --outline-subtle: 225 7% 15%;
+    --outline-strong: 225 7% 22%;
+    --icon-muted: 220 6% 66%;
+    --icon-active: 264 62% 74%;
+    --icon-tile: 264 30% 15%;
+    --icon-tile-foreground: 264 78% 84%;
+    --scrollbar-track: 225 7% 13%;
+    --scrollbar-thumb: 225 7% 42%;
+    --scrollbar-thumb-hover: 225 6% 54%;
+
+    /* Product planes — distinct chrome so views don't read as one mush.
+       Only signals/compute/messaging/budget are wired into
+       tailwind.config.ts (see src/lib/planes.ts); the rest are copied
+       verbatim from the reference token set for fidelity. */
+    --plane-observe: 220 6% 62%;
+    --plane-storage: 172 55% 42%;
+    --plane-l3: 32 85% 52%;
+    --plane-signals: 210 78% 58%;
+    --plane-messaging: 152 52% 44%;
+    --plane-compute: 264 62% 70%;
+    --plane-queue: 24 78% 52%;
+    --plane-budget: 18 80% 55%;
+    --plane-topology: 200 12% 58%;
+    --plane-learn: 280 35% 62%;
+  }
+
+  /* Light theme — applied by toggling `.light` on <html> (see the theme
+     toggle in components/Sidebar.tsx). Overrides the dark defaults above. */
+  :root.light {
+    --background: 220 20% 98%;
+    --foreground: 224 20% 14%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 20% 14%;
+    --primary: 264 60% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 92%;
+    --secondary-foreground: 224 18% 22%;
+    --muted: 220 14% 90%;
+    --muted-foreground: 220 8% 42%;
+    --accent: 220 14% 90%;
+    --accent-foreground: 224 20% 18%;
+    --destructive: 0 66% 48%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 86%;
+    --input: 220 13% 88%;
+    --ring: 264 60% 52%;
+
+    --ok: 152 52% 38%;
+    --ok-foreground: 152 40% 22%;
+    --warn: 32 82% 42%;
+    --warn-foreground: 32 60% 24%;
+    --info: 210 78% 46%;
+    --info-foreground: 210 60% 26%;
+
+    --surface-app: 220 20% 97%;
+    --surface-sidebar: 220 18% 99%;
+    --surface-panel: 0 0% 100%;
+    --surface-header: 220 16% 94%;
+    --surface-toolbar: 220 16% 95.5%;
+    --surface-input: 220 18% 98%;
+    --surface-hover: 220 16% 93%;
+    --surface-active: 220 16% 88%;
+    --surface-warn: 38 92% 93%;
+    --surface-danger: 358 84% 95%;
+    --outline-subtle: 220 13% 88%;
+    --outline-strong: 220 12% 78%;
+    --icon-muted: 220 8% 46%;
+    --icon-active: 264 60% 50%;
+    --icon-tile: 264 55% 92%;
+    --icon-tile-foreground: 264 62% 42%;
+    --scrollbar-track: 220 14% 90%;
+    --scrollbar-thumb: 220 10% 66%;
+    --scrollbar-thumb-hover: 220 10% 52%;
+
+    --plane-observe: 220 8% 42%;
+    --plane-storage: 172 58% 32%;
+    --plane-l3: 28 80% 38%;
+    --plane-signals: 210 78% 42%;
+    --plane-messaging: 152 55% 32%;
+    --plane-compute: 264 55% 46%;
+    --plane-queue: 24 72% 40%;
+    --plane-budget: 18 75% 40%;
+    --plane-topology: 200 10% 40%;
+    --plane-learn: 280 40% 42%;
+  }
+
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-surface-app text-foreground font-sans antialiased;
+    font-feature-settings: "cv11", "ss01", "ss03";
+    text-rendering: geometricPrecision;
+  }
+  svg {
+    @apply text-current;
+    stroke-width: 1.65;
+  }
+  ::selection {
+    background: hsl(var(--primary) / 0.24);
+  }
+  /* Visible keyboard focus everywhere — mouse clicks stay ring-free.
+     Interactive elements opt out of the UA outline via focus:outline-none;
+     this restores an accessible ring for keyboard users only. */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring) / 0.75);
+    outline-offset: 2px;
+    border-radius: var(--radius);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--scrollbar-track) / 0.72);
+  }
+  ::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 6px;
+    background: hsl(var(--scrollbar-thumb) / 0.9);
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--scrollbar-thumb-hover) / 0.95);
+    background-clip: content-box;
+  }
+  * {
+    scrollbar-color: hsl(var(--scrollbar-thumb) / 0.9) hsl(var(--scrollbar-track) / 0.72);
+    scrollbar-width: thin;
+  }
+}
+
+/* ---------------------------------------------------------------------
+   Live-session micro-animation.
+
+   The generation counter (components/LivePanel.tsx) is the one number in
+   this app whose *change* is the point — INV-6/rotation only means
+   something if a viewer can see it tick. Triggered exactly once per real
+   `meta.gen` change (never a synthetic loop); see the `justRotated` state
+   there.
+   --------------------------------------------------------------------- */
+@keyframes gen-rotate {
+  0% {
+    transform: scale(1.35);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+.gen-rotate {
+  color: hsl(var(--primary));
+  animation: gen-rotate 900ms ease;
+}
+
+/* ---------------------------------------------------------------------
+   Console controls.
+
+   Three kinds of button and one kind of input, repeated across the four
+   views. `btn-danger` is visually distinct from `btn-ghost` on purpose —
+   every button carrying it drives a real mock-IdP failure injection
+   (§8 item 5), and those must not look like routine navigation.
+   --------------------------------------------------------------------- */
+@layer components {
+  .btn-ghost {
+    @apply inline-flex items-center gap-1.5 rounded-md border border-outline-subtle bg-surface-input
+           px-2.5 py-1 text-[11px] text-muted-foreground transition-colors
+           hover:bg-surface-hover hover:text-foreground
+           disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-[11.5px]
+           font-medium text-primary-foreground transition-opacity
+           hover:opacity-90 disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .btn-danger {
+    @apply inline-flex items-center gap-1.5 rounded-md border border-destructive/45
+           bg-destructive/15 px-2.5 py-1 text-[11px] font-medium text-destructive
+           transition-colors hover:bg-destructive/25
+           disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .input {
+    @apply rounded-md border border-outline-subtle bg-surface-input px-2.5 py-1.5 text-[11.5px]
+           text-foreground placeholder:text-muted-foreground
+           focus:outline-none focus:ring-1 focus:ring-ring;
+  }
+}

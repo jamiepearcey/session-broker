@@ -1,0 +1,643 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 225 12% 4.5%;
+    --foreground: 220 8% 92%;
+    --card: 220 8% 10%;
+    --card-foreground: 220 8% 92%;
+    --primary: 264 62% 72%;
+    --primary-foreground: 210 20% 98%;
+    --secondary: 220 8% 15%;
+    --secondary-foreground: 220 8% 88%;
+    --muted: 220 7% 16%;
+    --muted-foreground: 220 6% 62%;
+    --accent: 220 8% 18%;
+    --accent-foreground: 220 8% 92%;
+    --destructive: 0 66% 52%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 220 7% 18%;
+    --input: 220 7% 19%;
+    --ring: 264 62% 72%;
+    --radius: 0.375rem;
+
+    /* Semantic state hues (badges / run pipeline). */
+    --ok: 152 46% 46%;
+    --ok-foreground: 150 40% 92%;
+    --warn: 38 82% 55%;
+    --warn-foreground: 40 60% 96%;
+    --info: 210 70% 62%;
+    --info-foreground: 210 60% 96%;
+
+    --surface-app: 225 12% 4.5%;
+    --surface-sidebar: 225 8% 8%;
+    --surface-panel: 225 8% 9.5%;
+    --surface-header: 225 8% 14%;
+    --surface-toolbar: 225 7% 12.5%;
+    --surface-input: 225 10% 6.5%;
+    --surface-hover: 225 7% 13%;
+    --surface-active: 225 7% 17%;
+    /* Callout surfaces. Opaque rather than an alpha wash: `bg-warn/20` over a
+       4.5%-lightness app surface composites to ~14% lightness — a brown stain,
+       not an amber panel. These carry the hue at a lightness that actually
+       reads, while staying dark enough for `--foreground` text to sit on. */
+    --surface-warn: 38 40% 26%;
+    --surface-danger: 358 34% 26%;
+    --outline-subtle: 225 7% 15%;
+    --outline-strong: 225 7% 22%;
+    --icon-muted: 220 6% 66%;
+    --icon-active: 264 62% 74%;
+    --icon-tile: 264 30% 15%;
+    --icon-tile-foreground: 264 78% 84%;
+    --scrollbar-track: 225 7% 13%;
+    --scrollbar-thumb: 225 7% 42%;
+    --scrollbar-thumb-hover: 225 6% 54%;
+
+    /* Product planes — distinct chrome so faces don't read as one mush. */
+    --plane-observe: 220 6% 62%;
+    --plane-storage: 172 55% 42%;
+    --plane-l3: 32 85% 52%;
+    --plane-signals: 210 78% 58%;
+    --plane-messaging: 152 52% 44%;
+    --plane-compute: 264 62% 70%;
+    --plane-queue: 24 78% 52%;
+    --plane-budget: 18 80% 55%;
+    --plane-topology: 200 12% 58%;
+    --plane-learn: 280 35% 62%;
+  }
+
+  /* Light theme — applied by toggling `.light` on <html> (see lib/settings +
+     applyTheme in main.tsx). Overrides the dark defaults above. */
+  :root.light {
+    --background: 220 20% 98%;
+    --foreground: 224 20% 14%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 20% 14%;
+    --primary: 264 60% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 92%;
+    --secondary-foreground: 224 18% 22%;
+    --muted: 220 14% 90%;
+    --muted-foreground: 220 8% 42%;
+    --accent: 220 14% 90%;
+    --accent-foreground: 224 20% 18%;
+    --destructive: 0 66% 48%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 86%;
+    --input: 220 13% 88%;
+    --ring: 264 60% 52%;
+
+    --ok: 152 52% 38%;
+    --ok-foreground: 152 40% 22%;
+    --warn: 32 82% 42%;
+    --warn-foreground: 32 60% 24%;
+    --info: 210 78% 46%;
+    --info-foreground: 210 60% 26%;
+
+    --surface-app: 220 20% 97%;
+    --surface-sidebar: 220 18% 99%;
+    --surface-panel: 0 0% 100%;
+    --surface-header: 220 16% 94%;
+    --surface-toolbar: 220 16% 95.5%;
+    --surface-input: 220 18% 98%;
+    --surface-hover: 220 16% 93%;
+    --surface-active: 220 16% 88%;
+    --surface-warn: 38 92% 93%;
+    --surface-danger: 358 84% 95%;
+    --outline-subtle: 220 13% 88%;
+    --outline-strong: 220 12% 78%;
+    --icon-muted: 220 8% 46%;
+    --icon-active: 264 60% 50%;
+    --icon-tile: 264 55% 92%;
+    --icon-tile-foreground: 264 62% 42%;
+    --scrollbar-track: 220 14% 90%;
+    --scrollbar-thumb: 220 10% 66%;
+    --scrollbar-thumb-hover: 220 10% 52%;
+
+    --plane-observe: 220 8% 42%;
+    --plane-storage: 172 58% 32%;
+    --plane-l3: 28 80% 38%;
+    --plane-signals: 210 78% 42%;
+    --plane-messaging: 152 55% 32%;
+    --plane-compute: 264 55% 46%;
+    --plane-queue: 24 72% 40%;
+    --plane-budget: 18 75% 40%;
+    --plane-topology: 200 10% 40%;
+    --plane-learn: 280 40% 42%;
+  }
+
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-surface-app text-foreground font-sans antialiased;
+    font-feature-settings: "cv11", "ss01", "ss03";
+    text-rendering: geometricPrecision;
+  }
+  svg {
+    @apply text-current;
+    stroke-width: 1.65;
+  }
+  ::selection {
+    background: hsl(var(--primary) / 0.24);
+  }
+  /* Visible keyboard focus everywhere — mouse clicks stay ring-free.
+     Interactive elements opt out of the UA outline via focus:outline-none;
+     this restores an accessible ring for keyboard users only. */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring) / 0.75);
+    outline-offset: 2px;
+    border-radius: var(--radius);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--scrollbar-track) / 0.72);
+  }
+  ::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 6px;
+    background: hsl(var(--scrollbar-thumb) / 0.9);
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--scrollbar-thumb-hover) / 0.95);
+    background-clip: content-box;
+  }
+  * {
+    scrollbar-color: hsl(var(--scrollbar-thumb) / 0.9) hsl(var(--scrollbar-track) / 0.72);
+    scrollbar-width: thin;
+  }
+}
+
+/* CubeCanvas emits Tailwind's sr-only utility from an external package; keep a
+   concrete local definition so its assistive text never leaks into layouts. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* Rendered markdown (docs + assistant answers). */
+.ar-prose > :first-child {
+  margin-top: 0;
+}
+.ar-prose > :last-child {
+  margin-bottom: 0;
+}
+.ar-prose h1,
+.ar-prose h2,
+.ar-prose h3 {
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 1.1em 0 0.5em;
+  color: hsl(var(--foreground));
+}
+.ar-prose h1 {
+  font-size: 1.35rem;
+  letter-spacing: -0.01em;
+}
+.ar-prose h2 {
+  font-size: 1.12rem;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid hsl(var(--outline-subtle));
+}
+.ar-prose h3 {
+  font-size: 1rem;
+}
+.ar-prose p,
+.ar-prose ul,
+.ar-prose ol,
+.ar-prose blockquote,
+.ar-prose table,
+.ar-prose pre {
+  margin: 0.6em 0;
+}
+.ar-prose ul,
+.ar-prose ol {
+  padding-left: 1.4em;
+}
+.ar-prose ul {
+  list-style: disc;
+}
+.ar-prose ol {
+  list-style: decimal;
+}
+.ar-prose li {
+  margin: 0.2em 0;
+}
+.ar-prose a {
+  color: hsl(var(--primary));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ar-prose strong {
+  color: hsl(var(--foreground));
+  font-weight: 600;
+}
+.ar-prose code {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.85em;
+  background: hsl(var(--surface-toolbar));
+  border: 1px solid hsl(var(--outline-subtle));
+  border-radius: 4px;
+  padding: 0.08em 0.34em;
+}
+.ar-prose pre {
+  background: hsl(var(--surface-input));
+  border: 1px solid hsl(var(--outline-subtle));
+  border-radius: 8px;
+  padding: 0.8em 1em;
+  overflow-x: auto;
+}
+.ar-prose pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 0.82em;
+}
+.ar-prose blockquote {
+  border-left: 3px solid hsl(var(--primary) / 0.5);
+  padding-left: 0.9em;
+  color: hsl(var(--muted-foreground));
+}
+.ar-prose table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.92em;
+}
+.ar-prose th,
+.ar-prose td {
+  border: 1px solid hsl(var(--outline-subtle));
+  padding: 0.35em 0.6em;
+  text-align: left;
+}
+.ar-prose th {
+  background: hsl(var(--surface-header));
+  font-weight: 600;
+}
+.ar-prose hr {
+  border: 0;
+  border-top: 1px solid hsl(var(--outline-subtle));
+  margin: 1.2em 0;
+}
+
+/* Containment view (project-docs/docs/architecture/containment-view.md) —
+   every one of these animations is triggered by a real telemetry event
+   (spawned/leased/crashed/timed_out/ping/…), never a synthetic loop. The
+   keyframes themselves are just the honest rendering of that event. */
+@keyframes containment-heartbeat {
+  from {
+    transform: scale(0.88);
+    opacity: 0.85;
+  }
+  to {
+    transform: scale(1.85);
+    opacity: 0;
+  }
+}
+@keyframes containment-flash {
+  0% {
+    opacity: 0.95;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes containment-shatter {
+  from {
+    transform: translate(0, 0) scale(1);
+    opacity: 1;
+  }
+  to {
+    transform: translate(var(--cx-dx, 0), var(--cx-dy, 0)) scale(0.35);
+    opacity: 0;
+  }
+}
+@keyframes containment-materialize {
+  from {
+    transform: scale(0.55);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.06);
+    opacity: 1;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@keyframes containment-guillotine {
+  0% {
+    transform: translateY(-100%);
+    opacity: 0.9;
+  }
+  55% {
+    transform: translateY(0%);
+    opacity: 0.9;
+  }
+  100% {
+    transform: translateY(120%);
+    opacity: 0;
+  }
+}
+@keyframes containment-glyph-slide {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(18px);
+    opacity: 0;
+  }
+}
+@keyframes containment-glyph-dissolve {
+  from {
+    transform: scale(1) rotate(0deg);
+    opacity: 1;
+  }
+  to {
+    transform: scale(0.6) rotate(8deg);
+    opacity: 0;
+  }
+}
+
+/*
+ * CubeCanvas theme bridge (same approach as CubeCanvas Studio).
+ *
+ * grid-react ships an unlayered `.dark:not([data-cube-theme="inherit"])` rule
+ * that rewrites --primary/--chart-* to slate/indigo whenever <html class="dark">.
+ * `html.dark:root` out-specifies that so the console purple palette sticks.
+ *
+ * Extended brand/surface tokens must also be set ON `[data-cube-theme="inherit"]`
+ * (and portaled popovers): grid-react remaps those on the themed node, so
+ * :root alone does not reach the grid chrome.
+ */
+html.dark:root,
+[data-cube-theme="inherit"],
+[data-cube-theme="inherit"][data-cube-mode="dark"] {
+  --background: 225 12% 4.5%;
+  --foreground: 220 8% 92%;
+  --card: 220 8% 10%;
+  --card-foreground: 220 8% 92%;
+  --popover: 220 9% 11%;
+  --popover-foreground: 220 8% 92%;
+  --primary: 264 62% 72%;
+  --primary-foreground: 210 20% 98%;
+  --secondary: 220 8% 15%;
+  --secondary-foreground: 220 8% 88%;
+  --muted: 220 7% 16%;
+  --muted-foreground: 220 6% 62%;
+  --accent: 220 8% 18%;
+  --accent-foreground: 220 8% 92%;
+  --destructive: 0 66% 52%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 220 7% 18%;
+  --input: 220 7% 19%;
+  --ring: 264 62% 72%;
+  --radius: 0.375rem;
+
+  --background-muted: 225 7% 12.5%;
+  --background-surface-75: 225 8% 11%;
+  --background-surface-100: 225 8% 12.5%;
+  --background-surface-200: 225 7% 14.5%;
+  --background-surface-300: 225 7% 16%;
+  --background-surface-400: 225 7% 18%;
+  --background-overlay-default: 225 7% 15%;
+  --background-overlay-hover: 225 7% 17%;
+  --background-selection: 264 34% 20%;
+
+  --foreground-light: 220 8% 86%;
+  --foreground-lighter: 220 7% 76%;
+  --foreground-muted: 220 6% 62%;
+
+  --border-strong: 225 7% 22%;
+  --border-control: 220 7% 19%;
+  --border-overlay: 225 7% 20%;
+
+  --brand-default: 264 62% 72%;
+  --brand-foreground: 210 20% 98%;
+  --brand-link: 264 62% 76%;
+  --brand-200: 264 34% 22%;
+  --brand-300: 264 42% 34%;
+  --brand-400: 264 50% 48%;
+  --brand-600: 264 62% 72%;
+  --brand-700: 264 65% 78%;
+
+  --chart-1: 264 62% 72%;
+  --chart-2: 160 70% 50%;
+  --chart-3: 32 85% 52%;
+  --chart-4: 199 85% 58%;
+  --chart-5: 346 74% 62%;
+  --chart-6: 142 60% 52%;
+  --chart-7: 48 92% 60%;
+  --chart-8: 220 70% 66%;
+
+  color-scheme: dark;
+}
+
+html.light:root,
+[data-cube-theme="inherit"][data-cube-mode="light"] {
+  --background: 220 20% 98%;
+  --foreground: 224 20% 14%;
+  --card: 0 0% 100%;
+  --card-foreground: 224 20% 14%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 224 20% 14%;
+  --primary: 264 60% 52%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 220 14% 92%;
+  --secondary-foreground: 224 18% 22%;
+  --muted: 220 14% 90%;
+  --muted-foreground: 220 8% 42%;
+  --accent: 220 14% 90%;
+  --accent-foreground: 224 20% 18%;
+  --destructive: 0 66% 48%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 220 13% 86%;
+  --input: 220 13% 88%;
+  --ring: 264 60% 52%;
+  --radius: 0.375rem;
+
+  --background-muted: 220 16% 95.5%;
+  --background-surface-75: 0 0% 100%;
+  --background-surface-100: 220 16% 97%;
+  --background-surface-200: 220 14% 94%;
+  --background-surface-300: 220 13% 90%;
+  --background-surface-400: 220 12% 86%;
+  --background-overlay-default: 0 0% 100%;
+  --background-overlay-hover: 220 16% 93%;
+  --background-selection: 264 55% 92%;
+
+  --foreground-light: 224 16% 28%;
+  --foreground-lighter: 220 10% 42%;
+  --foreground-muted: 220 8% 42%;
+
+  --border-strong: 220 12% 78%;
+  --border-control: 220 13% 86%;
+  --border-overlay: 220 13% 88%;
+
+  --brand-default: 264 60% 52%;
+  --brand-foreground: 0 0% 100%;
+  --brand-link: 264 60% 46%;
+  --brand-200: 264 55% 94%;
+  --brand-300: 264 50% 86%;
+  --brand-400: 264 55% 70%;
+  --brand-600: 264 60% 52%;
+  --brand-700: 264 62% 42%;
+
+  --chart-1: 264 60% 52%;
+  --chart-2: 160 70% 38%;
+  --chart-3: 28 80% 42%;
+  --chart-4: 199 85% 42%;
+  --chart-5: 346 74% 48%;
+  --chart-6: 142 60% 38%;
+  --chart-7: 48 92% 44%;
+  --chart-8: 220 70% 48%;
+
+  color-scheme: light;
+}
+
+/* Soften hard-coded zone blues so pivot chips match console neutrals + purple. */
+html.dark:root,
+html.light:root,
+[data-cube-theme="inherit"] {
+  --cube-zone-rows-bg: hsl(var(--surface-hover) / 0.55);
+  --cube-zone-rows-border: hsl(var(--primary) / 0.22);
+  --cube-zone-rows-over-bg: hsl(var(--primary) / 0.12);
+  --cube-zone-rows-over-border: hsl(var(--primary) / 0.55);
+  --cube-zone-rows-badge-bg: hsl(var(--primary) / 0.14);
+  --cube-zone-rows-badge-text: hsl(var(--primary));
+  --cube-zone-rows-chip-border: hsl(var(--primary) / 0.28);
+  --cube-zone-rows-chip-text: hsl(var(--primary));
+  --cube-zone-rows-summary-bg: hsl(var(--surface-hover) / 0.7);
+  --cube-zone-filters-bg: hsl(var(--surface-hover) / 0.4);
+  --cube-zone-filters-border: hsl(var(--outline-subtle));
+  --cube-zone-filters-badge-bg: hsl(var(--surface-active) / 0.8);
+  --cube-zone-filters-badge-text: hsl(var(--muted-foreground));
+  --cube-zone-filters-chip-border: hsl(var(--outline-subtle));
+  --cube-zone-filters-chip-text: hsl(var(--muted-foreground));
+  --cube-zone-filters-accent: hsl(var(--primary));
+}
+
+/* Map --cube-grid-* onto console surfaces. Wrap <CubeGrid theme="inherit">. */
+.cube-studio-grid,
+.cube-studio-grid [data-cube-theme] {
+  --cube-grid-font: inherit;
+  --cube-grid-radius: var(--radius);
+  --cube-grid-bg: hsl(var(--surface-panel));
+  --cube-grid-text: hsl(var(--foreground));
+  --cube-grid-muted-text: hsl(var(--muted-foreground));
+  --cube-grid-border: hsl(var(--outline-subtle));
+  --cube-grid-header-bg: hsl(var(--surface-header));
+  --cube-grid-header-hover-bg: hsl(var(--surface-hover));
+  --cube-grid-header-text: hsl(var(--foreground));
+  --cube-grid-column-divider: hsl(var(--outline-subtle) / 0.85);
+  --cube-grid-pinned-bg: hsl(var(--surface-panel));
+  --cube-grid-footer-bg: hsl(var(--surface-toolbar));
+  --cube-grid-row-hover-bg: hsl(var(--surface-hover));
+  --cube-grid-row-hover-overlay: hsl(var(--surface-hover) / 0.62);
+  --cube-grid-row-active-bg: hsl(var(--primary) / 0.11);
+  --cube-grid-row-active-bg-hover: hsl(var(--primary) / 0.16);
+  --cube-grid-row-selected-bg: hsl(var(--primary) / 0.1);
+  --cube-grid-row-selected-bg-hover: hsl(var(--primary) / 0.16);
+  --cube-grid-row-selected-overlay: hsl(var(--primary) / 0.14);
+  --cube-grid-row-selected-overlay-hover: hsl(var(--primary) / 0.22);
+  --cube-grid-cell-range-selected-overlay: hsl(var(--primary) / 0.16);
+  --cube-grid-cell-range-selected-overlay-hover: hsl(var(--primary) / 0.28);
+  --cube-grid-cell-range-selected-border: hsl(var(--primary) / 0.72);
+  --cube-grid-drag-indicator: hsl(var(--primary));
+  --cube-grid-drag-indicator-glow: hsl(var(--primary) / 0.16);
+  --cube-grid-resize-handle: hsl(var(--primary) / 0.32);
+  --cube-grid-resize-handle-active: hsl(var(--primary));
+  --cube-grid-scrollbar-bg: hsl(var(--surface-toolbar));
+  --cube-grid-scrollbar-track: hsl(var(--surface-panel));
+  --cube-grid-scrollbar-track-border: hsl(var(--outline-subtle));
+  --cube-grid-scrollbar-thumb: hsl(var(--scrollbar-thumb) / 0.9);
+  --cube-grid-scrollbar-thumb-hover: hsl(var(--scrollbar-thumb-hover) / 0.95);
+  --cube-grid-scrollbar-thumb-active: hsl(var(--foreground) / 0.72);
+  --cube-grid-scrollbar-size: 10px;
+  --cube-grid-loading-bg: hsl(var(--surface-panel) / 0.78);
+  --cube-grid-splash-bg: hsl(var(--surface-panel) / 0.88);
+  --cube-grid-splash-spinner: hsl(var(--primary));
+  --cube-grid-splash-spinner-track: hsl(var(--outline-subtle));
+  --cube-grid-error-bg: hsl(var(--destructive) / 0.1);
+  --cube-grid-error-text: hsl(var(--destructive));
+  --cube-grid-error-border: hsl(var(--destructive) / 0.28);
+  --cube-dual-icon-accent: hsl(var(--brand-default, var(--primary)));
+  color: hsl(var(--foreground));
+}
+.cube-studio-grid .cube-grid {
+  border: 0 !important;
+  border-radius: 0 !important;
+}
+.cube-studio-grid .cube-grid-cell,
+.cube-studio-grid .cube-grid-meta-cell,
+.cube-studio-grid .cube-grid-row-number-cell,
+.cube-studio-grid .cube-grid-group-cell {
+  font-variant-numeric: tabular-nums;
+}
+.cube-studio-grid .cube-grid-status-bar {
+  border-top: 1px solid hsl(var(--outline-subtle));
+  background: hsl(var(--surface-toolbar));
+  color: hsl(var(--muted-foreground));
+}
+
+/* ---------------------------------------------------------------------
+   Console controls.
+
+   ArrowRef's console spells these out at each call site; here they are three
+   named classes because this app has exactly three kinds of button and one
+   kind of input, repeated across three views. `btn-danger` is visually
+   distinct from `btn-ghost` on purpose — every button carrying it performs an
+   irreversible action (revoke a key, sign out a session), and those must not
+   look like the refresh next to them.
+   --------------------------------------------------------------------- */
+@layer components {
+  .btn-ghost {
+    @apply inline-flex items-center gap-1.5 rounded-md border border-outline-subtle bg-surface-input
+           px-2.5 py-1 text-[11px] text-muted-foreground transition-colors
+           hover:bg-surface-hover hover:text-foreground
+           disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-[11.5px]
+           font-medium text-primary-foreground transition-opacity
+           hover:opacity-90 disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .btn-danger {
+    @apply inline-flex items-center gap-1.5 rounded-md border border-destructive/45
+           bg-destructive/15 px-2.5 py-1 text-[11px] font-medium text-destructive
+           transition-colors hover:bg-destructive/25
+           disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .input {
+    @apply rounded-md border border-outline-subtle bg-surface-input px-2.5 py-1.5 text-[11.5px]
+           text-foreground placeholder:text-muted-foreground
+           focus:outline-none focus:ring-1 focus:ring-ring;
+  }
+}

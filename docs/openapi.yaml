@@ -1,0 +1,530 @@
+openapi: 3.1.0
+
+# The session-broker HTTP contract.
+#
+# Hand-written rather than generated. The endpoints are few and stable, and the
+# thing worth documenting here is not the shapes — it is which LISTENER each
+# endpoint is on and what each refusal means, neither of which a code generator
+# would infer. Keep this in step with `docs/architecture/implementation-strategy.md` §4.
+#
+# THREE LANES, TWO LISTENERS:
+#
+#   public   (bind_addr)          /auth/*, /session*, /logout   — the browser
+#   internal (internal_bind_addr) /internal/token               — backend services
+#   internal (internal_bind_addr) /admin/*                      — operators/console
+#
+# The internal listener must not be internet-reachable. Both lanes on it still
+# require authentication regardless, because a bind address is a deployment
+# promise rather than an enforced invariant.
+
+info:
+  title: session-broker
+  version: 0.1.0
+  summary: Brokers browser sessions against an upstream OIDC provider and takes custody of the upstream tokens.
+  description: |
+    Three properties define the service, in priority order:
+
+    1. **Non-invalidating rotation.** Issuing a new session cookie does not
+       invalidate the previous one; generations overlap for a grace window.
+       This removes the refresh race class outright rather than coordinating
+       around it.
+    2. **Local-only fast refresh.** Session lifetime is decoupled from upstream
+       token lifetime. `POST /session/refresh` performs no network I/O (INV-8).
+    3. **Server-side guarantees, dumb client.** The browser SDK needs no
+       cross-tab coordination beyond one Web Lock.
+
+    ## Cookies
+
+    - `__Host-broker_session` (`broker_session` over loopback) — `HttpOnly`,
+      `SameSite=Lax`. The credential. Never readable by script.
+    - `broker_meta` — deliberately readable by script (INV-9), and deliberately
+      **unsigned**. It is a client hint. The server never reads it back, and
+      signing it would imply it could be trusted as input.
+
+    ## CSRF
+
+    Same-origin path-mounted deployment is the default (INV-10, ADR-0012), so
+    there is no CORS surface. The CSRF boundary is `Sec-Fetch-Site` / `Origin`
+    on unsafe methods (ADR-0004), which the browser sets and script cannot forge.
+  license:
+    name: MIT OR Apache-2.0
+
+servers:
+  - url: https://app.example.com
+    description: Public lane, path-mounted on the SPA's own origin (ADR-0012).
+  - url: http://127.0.0.1:8090
+    description: Internal lane — token exchange and admin. Not internet-reachable.
+
+tags:
+  - name: auth
+    description: OAuth2/OIDC authorization-code entry path (public lane).
+  - name: session
+    description: Session lifecycle (public lane). No network I/O on the hot path.
+  - name: internal
+    description: Backend token exchange (internal lane, dual authentication).
+  - name: admin
+    description: Key, session and custody management (internal lane).
+
+paths:
+  /healthz:
+    get:
+      tags: [session]
+      summary: Liveness. Present on BOTH listeners.
+      security: []
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+
+  /auth/login:
+    get:
+      tags: [auth]
+      summary: Begin a login.
+      description: |
+        Starts a server-side login transaction (INV-3) — `state`, PKCE verifier
+        and `nonce` are stored server-side and the browser receives only an
+        opaque txn id in `__Host-broker_txn` — then redirects to the IdP.
+      security: []
+      parameters:
+        - name: return_to
+          in: query
+          required: false
+          description: |
+            Where to land after a successful callback. Must be a **same-origin
+            absolute path** (INV-4). Anything else is rejected outright rather
+            than silently downgraded: nothing has been created yet, so there is
+            nothing to protect by continuing.
+          schema: { type: string, example: /dashboard }
+      responses:
+        "303":
+          description: Redirect to the IdP's authorization endpoint.
+          headers:
+            Location: { schema: { type: string } }
+            Set-Cookie:
+              description: "`__Host-broker_txn`, `HttpOnly`, `Max-Age=600`."
+              schema: { type: string }
+        "400":
+          description: "`return_to` was not a same-origin absolute path."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /auth/callback:
+    get:
+      tags: [auth]
+      summary: Redeem the authorization code and mint a session.
+      description: |
+        The txn is consumed on FIRST TOUCH, success or failure alike (INV-3c),
+        so a replayed callback finds nothing.
+
+        Every failure — missing txn cookie, `state` mismatch, expired txn, failed
+        exchange, bad `id_token`, or custody that could not be persisted — lands
+        on the error page and creates **no session**. There is no partial success:
+        a session without a durable upstream grant would appear to work and be
+        unable to do anything.
+      security: []
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string }, description: The IdP-reported-error form. }
+      responses:
+        "303":
+          description: |
+            On success, redirect to the txn's stored `return_to` with the session
+            and meta cookies set. On any failure, redirect to
+            `/error?error=oauth_error` with no session.
+          headers:
+            Location: { schema: { type: string } }
+            Set-Cookie: { schema: { type: string } }
+
+  /session:
+    get:
+      tags: [session]
+      summary: The current session's meta.
+      description: Read-only. Answers from memory; performs no I/O.
+      responses:
+        "200":
+          description: A live session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionMeta" }
+        "401":
+          description: No session, or one that no longer authenticates.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /session/refresh:
+    post:
+      tags: [session]
+      summary: Rotate (or coalesce onto) the current generation.
+      description: |
+        **Performs no network I/O** (INV-8) — it never calls the IdP. Refreshes
+        arriving within the coalesce window re-issue the current generation
+        rather than minting, so N concurrent refreshes mint exactly once.
+
+        Rotation is non-invalidating: the previous cookie stays valid for the
+        grace window, which is why a client needs no cross-tab coordination.
+      responses:
+        "200":
+          description: Session refreshed. Both cookies re-issued.
+          headers:
+            Set-Cookie: { schema: { type: string } }
+            X-Broker-Handler-Us:
+              description: Server-side handler time in microseconds, for the demo's RTT panel.
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionMeta" }
+        "401":
+          description: Unknown token, a retired generation, or an expired session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "403":
+          description: The CSRF boundary refused this request (ADR-0004).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+    get:
+      tags: [session]
+      summary: Interactive refresh — a browser navigation, not a fetch.
+      parameters:
+        - { name: interactive, in: query, schema: { type: string, enum: ["1"] } }
+        - { name: return_to, in: query, schema: { type: string } }
+      responses:
+        "303":
+          description: Redirect back to `return_to`, or to login if the session is gone.
+
+  /logout:
+    post:
+      tags: [session]
+      summary: End the session everywhere.
+      description: |
+        One tombstone kills every generation at once (INV-7, ADR-0010). Clearing
+        an already-expired session still succeeds — logout must never fail.
+      responses:
+        "204":
+          description: Session ended; both cookies expired.
+          headers:
+            Set-Cookie: { schema: { type: string } }
+
+  /internal/token:
+    post:
+      tags: [internal]
+      summary: Exchange a session token for the custodied upstream access token.
+      description: |
+        **Dual authentication, and neither half is sufficient** (INV-11, ADR-0007):
+
+        - a broker API key proves the caller is a trusted backend — on its own it
+          cannot name a user;
+        - a live session token proves *which* user — on its own it yields nothing,
+          which is what stops a cookie stolen by XSS from being exchanged, since
+          the browser does not hold the key.
+
+        **No inline refresh.** If the custodied access token has expired this
+        answers `custody_unavailable` rather than calling the IdP (INV-8): a
+        backend seeing it should retry, not treat it as an auth failure.
+
+        Two kinds of key work here. Keys **issued** through `/admin/api-keys` are
+        the normal case and can be revoked without a restart. The single
+        **bootstrap** key from config exists so the first issued key can be
+        created, and cannot be revoked without a deploy.
+      security:
+        - brokerApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_token]
+              properties:
+                session_token:
+                  type: string
+                  description: The raw session cookie value, forwarded by the backend.
+      responses:
+        "200":
+          description: The current upstream access token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, sub, expires_at]
+                properties:
+                  access_token: { type: string }
+                  sub:
+                    type: string
+                    description: The IdP subject. Opaque — map it to your own user model.
+                  expires_at: { type: integer, description: Unix seconds. }
+                  scope: { type: string, nullable: true }
+        "401":
+          description: |
+            `missing_api_key` / `bad_api_key` — the CALLER's credential is wrong;
+            an operator problem, not the user's.
+            `session_not_active` — the session does not authenticate resource access.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "501":
+          description: "`lane_disabled` — no broker API keys are configured."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "503":
+          description: |
+            `upstream_revoked` — the grant behind this session is dead.
+            `custody_unavailable` — the access token has expired and has not yet
+            been renewed by the keepalive worker. **Retry; do not log the user out.**
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+
+  /admin/api-keys:
+    get:
+      tags: [admin]
+      summary: List backend API keys.
+      description: |
+        Live and revoked, newest first. Revoked keys are kept rather than deleted
+        — "this key was revoked last Tuesday" is the answer an incident review
+        needs. **Secrets are never returned.**
+      security: [{ adminApiKey: [] }]
+      responses:
+        "200":
+          description: The keys.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ApiKey" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+    post:
+      tags: [admin]
+      summary: Issue a new backend API key.
+      description: |
+        **The secret is returned exactly once, here.** Only its SHA-256 is
+        stored, and no endpoint reveals it afterwards — a leaked console database
+        should expose *who holds access*, not the access itself. Losing a key
+        means issuing a new one.
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: Which backend this key is for. Five keys named "key" answer nothing during an incident.
+      responses:
+        "201":
+          description: Key issued. Store the secret now; it cannot be retrieved again.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key_id, name, secret, created_at]
+                properties:
+                  key_id: { type: string, example: bk_9f3a2c1b7d4e6f80 }
+                  name: { type: string }
+                  secret: { type: string, description: Shown once. Not recoverable. }
+                  created_at: { type: integer }
+        "400":
+          description: "`name_required`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+
+  /admin/api-keys/{key_id}:
+    delete:
+      tags: [admin]
+      summary: Revoke a key.
+      description: |
+        Takes effect on the next request — there is no cache to wait out and no
+        restart required, which is what makes this meaningful rather than
+        advisory.
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { name: key_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Revoked. }
+        "404":
+          description: |
+            `unknown_key` — no LIVE key with that id. Reported rather than
+            swallowed: "revoked" and "there was nothing to revoke" must not look
+            alike to someone racing to cut off access.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+
+  /admin/sessions:
+    get:
+      tags: [admin]
+      summary: List live sessions.
+      description: |
+        Read from the store, not the in-memory map: the map holds token hashes,
+        and an admin surface has no business near credential material even in
+        hashed form.
+      security: [{ adminApiKey: [] }]
+      responses:
+        "200":
+          description: Live sessions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AdminSession" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+
+  /admin/sessions/{sid}:
+    delete:
+      tags: [admin]
+      summary: Force-logout a session.
+      description: Kills every generation at once (INV-7), in memory and durably.
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { name: sid, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Session revoked. }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+
+  /admin/custody:
+    get:
+      tags: [admin]
+      summary: Upstream grant health.
+      description: |
+        Excludes `dead` custodies, whose grant will never work again. A session
+        can be perfectly valid while the token behind it is degraded — this is
+        where that shows.
+      security: [{ adminApiKey: [] }]
+      responses:
+        "200":
+          description: Custody schedule and health.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Custody" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-broker_session
+      description: "`HttpOnly`. Sent automatically on same-origin requests; script can never read it."
+    brokerApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        A backend API key — issued via `/admin/api-keys`, or the bootstrap key
+        from config. Required IN ADDITION to a session token; neither alone is
+        sufficient.
+    adminApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        The admin key. Deliberately a DIFFERENT value from the backend key: one
+        that can mint keys is strictly more powerful than one that exchanges a
+        session for a token, and sharing them would let every backend service
+        issue credentials for itself.
+
+  responses:
+    AdminUnauthorised:
+      description: "`unauthorised` — a valid admin API key is required."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/LaneError" }
+    AdminDisabled:
+      description: "`lane_disabled` — no `admin_api_key` is configured, so the lane is off. Unconfigured means closed, not open."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/LaneError" }
+
+  schemas:
+    SessionMeta:
+      type: object
+      description: |
+        Also the decoded content of the `broker_meta` cookie. Non-secret by
+        construction and unsigned on purpose (INV-9) — the server never reads it
+        back, so nothing here is a basis for a decision.
+      required: [v, sub, sid, gen, active_until, refresh_until, absolute_until, custody]
+      properties:
+        v: { type: integer, const: 1 }
+        sub: { type: string }
+        sid: { type: string }
+        gen: { type: integer, description: Generation number; increments on each rotation. }
+        active_until: { type: integer, description: Unix seconds — when this generation stops authenticating. }
+        refresh_until: { type: integer, description: Idle expiry; slides on use. }
+        absolute_until: { type: integer, description: Hard ceiling; never slides. }
+        custody:
+          type: string
+          enum: [ok, degraded, dead]
+          description: Health of the upstream grant behind this session.
+
+    ApiKey:
+      type: object
+      required: [key_id, name, created_at, live]
+      properties:
+        key_id: { type: string }
+        name: { type: string }
+        created_at: { type: integer }
+        created_by: { type: string, nullable: true }
+        last_used_at: { type: integer, nullable: true }
+        revoked_at: { type: integer, nullable: true }
+        live:
+          type: boolean
+          description: Derived from `revoked_at`, so the console and the token lane cannot disagree about what "live" means.
+
+    AdminSession:
+      type: object
+      required: [sid, sub, custody_id, current_gen, idle_exp, absolute_exp]
+      properties:
+        sid: { type: string }
+        sub: { type: string }
+        custody_id: { type: string }
+        current_gen: { type: integer }
+        idle_exp: { type: integer }
+        absolute_exp: { type: integer }
+
+    Custody:
+      type: object
+      required: [custody_id, status, access_exp, next_refresh, fail_count]
+      properties:
+        custody_id: { type: string }
+        status: { type: string, enum: [ok, degraded, dead] }
+        access_exp: { type: integer }
+        next_refresh: { type: integer }
+        fail_count: { type: integer }
+
+    ApiError:
+      type: object
+      description: The public lane's error shape.
+      properties:
+        code: { type: string }
+        message: { type: string }
+        login_url:
+          type: string
+          nullable: true
+          description: Where to send the browser to re-authenticate, so the SDK never builds one itself.
+
+    LaneError:
+      type: object
+      description: The internal and admin lanes' error shape.
+      required: [error, detail]
+      properties:
+        error:
+          type: string
+          description: A stable machine-readable code. Clients should branch on this, not on the status alone.
+        detail: { type: string }
+
+security:
+  - sessionCookie: []

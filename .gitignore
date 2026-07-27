@@ -1,0 +1,24 @@
+# Rust build output. `target_*` too: scratch target dirs from parallel builds
+# have a habit of turning up here and they are enormous.
+target/
+target_*/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local runtime state. The `.key` file is the custody encryption key — it
+# decrypts every stored upstream refresh token, so it must never be committed.
+# The `.db` files are the session store, which holds live session material.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.key
+session-broker.toml
+
+# Local run logs
+*.log
+
+.DS_Store
