@@ -24,9 +24,8 @@ use std::io;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
-use chacha20poly1305::{AeadCore, XChaCha20Poly1305, XNonce};
-use rand::RngCore;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 /// 32 raw bytes. Not `Vec<u8>`: a fixed size makes "the keyfile is the wrong
 /// length" a load-time error rather than a decrypt-time one.
@@ -114,7 +113,7 @@ fn restrict(_path: &Path) -> io::Result<()> {
 
 fn random_key() -> KeyBytes {
     let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    crate::token::fill_random(&mut key);
     key
 }
 
@@ -133,7 +132,14 @@ fn cipher() -> XChaCha20Poly1305 {
 /// caller could do about an AEAD failure here except refuse to run, and
 /// XChaCha20-Poly1305 encryption does not fail for well-formed input.
 pub(crate) fn seal(plaintext: &[u8]) -> Vec<u8> {
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    // 24 random bytes straight from the same OS CSPRNG the key came from,
+    // rather than the AEAD crate's nonce helper. XChaCha20's nonce is large
+    // enough that random generation is the intended construction, and routing
+    // it through `fill_random` means every byte of secret material in this
+    // service has one provenance to audit instead of two.
+    let mut nonce_bytes = [0u8; 24];
+    crate::token::fill_random(&mut nonce_bytes);
+    let nonce = XNonce::from(nonce_bytes);
     let ciphertext = cipher()
         .encrypt(&nonce, plaintext)
         .expect("XChaCha20-Poly1305 encryption cannot fail for well-formed input");
@@ -155,8 +161,14 @@ pub(crate) fn open(sealed: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
     let (nonce, ciphertext) = sealed.split_at(NONCE_LEN);
+    // `TryFrom` rather than the deprecated `from_slice`. The length was already
+    // checked above, so this cannot fail — but a panicking `expect` on the
+    // decrypt path of every custody read is not worth the one line it saves.
+    let Ok(nonce) = XNonce::try_from(nonce) else {
+        return Err("sealed value has a malformed nonce prefix".to_owned());
+    };
     cipher()
-        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| {
             "custody value failed authenticated decryption (wrong key, or the row was altered)"
                 .to_owned()

@@ -83,8 +83,8 @@ pub struct RandJitter;
 
 impl Jitter for RandJitter {
     fn unit(&self) -> f64 {
-        use rand::Rng as _;
-        rand::thread_rng().gen_range(0.0..1.0)
+        use rand::RngExt as _;
+        rand::rng().random_range(0.0..1.0)
     }
 }
 

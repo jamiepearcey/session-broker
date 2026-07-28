@@ -37,7 +37,6 @@ use openidconnect::{
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope,
     TokenResponse as OidcTokenResponse,
 };
-use rand::RngCore;
 
 use crate::clock::Timestamp;
 use crate::config::OidcConfig;
@@ -540,7 +539,7 @@ fn classify_refresh_error<E: std::error::Error + 'static>(
 /// nobody can guess another user's in-flight txn or a future session id.
 pub(crate) fn random_id() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    crate::token::fill_random(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

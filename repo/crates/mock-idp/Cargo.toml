@@ -22,7 +22,16 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 jsonwebtoken.workspace = true
-rand.workspace = true
+# Pinned to 0.8 rather than the workspace's 0.10, deliberately.
+#
+# `rsa` still uses rand_core 0.6, and its key generation takes an RNG from that
+# generation — so a 0.10 RNG does not satisfy the bound. Pinning here rather
+# than holding the whole workspace back keeps the BROKER on current `rand`,
+# which is where it matters: this crate is a dev-dependency test fixture and is
+# excluded from every release artifact, so the older RNG never ships.
+#
+# Revisit when `rsa` moves to rand_core 0.9+.
+rand = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -15,20 +15,24 @@ rust-version = "1.88"
 [workspace.dependencies]
 anyhow = "1.0"
 axum = "0.8.9"
-base64 = "0.22"
-chacha20poly1305 = "0.10"
+base64 = "0.23"
+chacha20poly1305 = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 dashmap = "6.1"
-jsonwebtoken = "9.3.1"
+# `rust_crypto`, not `aws_lc_rs`: jsonwebtoken 11 requires the provider to be
+# chosen explicitly (it panics at first use otherwise, not at build time). Pure
+# Rust is the same call this workspace already makes for reqwest's `rustls-tls`,
+# and it keeps a C toolchain out of a crate that only the test fixture uses.
+jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 openidconnect = "4.0.1"
-rand = "0.8"
+rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 proptest = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 smallvec = "1.13"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }

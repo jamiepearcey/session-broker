@@ -40,3 +40,12 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # `dtolnay/rust-toolchain` is referenced by TAG, and one of those tags is
+      # the MSRV the `msrv` job exists to check. Dependabot reads that ref as an
+      # action version and bumps it, which silently converts the job from "does
+      # this build on 1.88?" into "does this build on the newest toolchain?" —
+      # the question every other job already answers. It did exactly that on its
+      # first run. `ci.yml` now passes the toolchain as a `with:` value so the
+      # ref is safe to bump, and this stays as the second lock on the door.
+      - dependency-name: dtolnay/rust-toolchain
