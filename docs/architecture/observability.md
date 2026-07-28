@@ -97,7 +97,7 @@ Every key is `BROKER_<KEY>` in the environment or a bare key in
 | Key | Default | Meaning |
 |---|---|---|
 | `log_format` | `text` | `text` for humans, `json` for a collector. Set `json` anywhere with a shipper. |
-| `log_level` | `session_broker=info,tower_http=warn` | The default `EnvFilter` directive. `RUST_LOG`, if set, still wins over this. |
+| `log_level` | `session_broker=info,broker=info,tower_http=warn` | The default `EnvFilter` directive. `RUST_LOG`, if set, still wins over this. **Keep a `broker` directive.** This service's events carry explicit targets (`broker::audit`, `broker::http`, …) and `EnvFilter` matches the TARGET, not the crate — a filter naming only `session_broker` silently drops every one of them, audit stream included. |
 | `log_file` | *(unset)* | Optional second sink. Unset means stdout only, which is the recommended deployment. |
 | `log_file_rotation` | `daily` | `daily`, `hourly` or `never`. Rotation only; **pruning old files is the deployment's job** (logrotate, a retention policy on the volume) — the broker does not delete files it has closed. |
 | `log_queue_capacity` | `16384` | Lines buffered before the writer thread drops. Drops are reported on stderr by the appender and counted. |

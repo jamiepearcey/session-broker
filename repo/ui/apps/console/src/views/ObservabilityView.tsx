@@ -34,11 +34,17 @@ import { adminApi, fmtTime, fmtUntil, type Observability } from "@/lib/api";
  *  `EnvFilter` takes per-target directives and during an incident that is the
  *  shape you want — the whole broker at trace is mostly noise from the parts
  *  that are working. */
-const DEFAULT_FILTER = "session_broker=debug";
+// Every preset names BOTH `session_broker` (the crate's module-path events) and
+// `broker` (the explicit targets — `broker::http`, `broker::authz`,
+// `broker::audit`, `broker::telemetry`). An `EnvFilter` directive matches the
+// target, so `session_broker=debug` alone turns on none of the per-request or
+// authz detail an operator raising verbosity during an incident is actually
+// after — it looks like it worked and shows nothing.
+const DEFAULT_FILTER = "session_broker=debug,broker=debug";
 
 const PRESETS = [
   { label: "Debug (whole broker)", filter: DEFAULT_FILTER },
-  { label: "Trace (whole broker)", filter: "session_broker=trace" },
+  { label: "Trace (whole broker)", filter: "session_broker=trace,broker=trace" },
   { label: "HTTP requests", filter: "session_broker=info,broker::http=debug" },
   { label: "Authz decisions", filter: "session_broker=info,broker::authz=debug" },
   { label: "Audit stream", filter: "session_broker=info,broker::audit=debug" },
