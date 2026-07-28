@@ -59,7 +59,7 @@ jobs:
       run:
         working-directory: repo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -91,9 +91,17 @@ jobs:
       run:
         working-directory: repo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # The toolchain is a `with:` value, NOT the action ref. Pinning it as
+        # `dtolnay/rust-toolchain@1.88.0` reads naturally and is a trap: Dependabot
+        # treats the ref as an action version and bumps it, which silently converts
+        # this job from "does it build on the MSRV?" into "does it build on the
+        # newest toolchain?" — the one question every other job already answers.
+        # Keep this in step with `rust-version` in repo/Cargo.toml.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -113,7 +121,7 @@ jobs:
       run:
         working-directory: repo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -128,13 +136,13 @@ jobs:
       run:
         working-directory: repo/ui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: pnpm
@@ -169,8 +177,8 @@ jobs:
     name: Contract — OpenAPI 3.1
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - name: Lint the contract

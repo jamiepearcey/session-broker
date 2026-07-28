@@ -156,13 +156,35 @@ fn a_revoke_that_matched_nothing_is_recorded_as_a_failure() {
     assert_eq!(audit[0].row.reason.as_deref(), Some("not_found"));
 }
 
+impl Harness {
+    /// Block until the writer has applied everything enqueued so far.
+    ///
+    /// Polls the sink's own depth counter rather than sleeping a fixed
+    /// duration. A `sleep(300ms)` passes on an idle laptop and fails on a
+    /// loaded CI runner, which is a flake dressed up as a test — and this
+    /// suite runs 150 tests in parallel, so "loaded" is the normal case.
+    fn drain(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            self.flush();
+            if self.sink.depth() == 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never drained; depth is stuck at {}",
+                self.sink.depth()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 /// The Tier-B claim: an incomplete record says so. A silently short record is
 /// the failure mode the whole drop-counting apparatus exists to prevent.
 #[test]
 fn overflowing_the_tier_b_queue_leaves_a_gap_marker_not_a_silence() {
-    // Capacity 1 makes the bound trivial to reach deterministically. The writer
-    // is running, so the queue also drains — which is what lets the gap row be
-    // emitted rather than dropped along with everything else.
+    // Capacity 1 makes the bound trivial to reach deterministically.
     let h = harness(
         "gap",
         AuditConfig {
@@ -183,21 +205,29 @@ fn overflowing_the_tier_b_queue_leaves_a_gap_marker_not_a_silence() {
             .detail(serde_json::json!({ "i": i })),
         );
     }
-    h.flush();
-    // The writer batches on a 50ms timer; give it room to drain what a burst of
-    // 200 enqueues left behind.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    h.flush();
 
-    let rows = h.rows();
     let dropped = h.metrics.audit_dropped_total();
     assert!(
         dropped > 0,
         "capacity 1 under a burst of 200 must drop some"
     );
+
+    // Drain first, THEN record one more. The gap row is emitted by the next
+    // accepted event, so forcing the queue empty before that event makes the
+    // sequence deterministic instead of a race with the writer's 50ms timer.
+    h.drain();
+    h.sink.record(Event::new(
+        action::SESSION_CREATED,
+        Outcome::Success,
+        ActorKind::User,
+        T0,
+    ));
+    h.drain();
+
+    let rows = h.rows();
     assert!(
-        rows.len() < 200,
-        "and the record must be genuinely short: {} rows",
+        rows.len() < 201,
+        "the record must be genuinely short: {} rows",
         rows.len()
     );
 
@@ -228,9 +258,7 @@ fn queue_depth_returns_to_zero_after_the_writer_drains() {
             T0,
         ));
     }
-    h.flush();
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    h.flush();
+    h.drain();
     assert_eq!(
         h.sink.depth(),
         0,
@@ -368,13 +396,11 @@ fn pruning_drops_rows_past_the_window_and_leaves_the_rest() {
         ActorKind::User,
         T0,
     ));
-    h.flush();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    h.drain();
     assert_eq!(h.rows().len(), 2);
 
     h.sink.prune(T0);
-    h.flush();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    h.drain();
 
     let rows = h.rows();
     assert_eq!(rows.len(), 1, "the row past the window is gone");
@@ -389,8 +415,7 @@ fn pruning_drops_rows_past_the_window_and_leaves_the_rest() {
         ActorKind::User,
         T0,
     ));
-    h.flush();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    h.drain();
     let after = h.rows();
     assert!(
         after[0].seq > before,
@@ -415,12 +440,10 @@ fn zero_retention_days_prunes_nothing() {
         ActorKind::User,
         Timestamp(1),
     ));
-    h.flush();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    h.drain();
 
     h.sink.prune(T0);
-    h.flush();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    h.drain();
     assert_eq!(h.rows().len(), 1, "a row from 1970 must survive");
 }
 
@@ -435,8 +458,7 @@ fn action_filters_match_by_prefix_without_treating_underscores_as_wildcards() {
         h.sink
             .record(Event::new(action, Outcome::Success, ActorKind::Admin, T0));
     }
-    h.flush();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    h.drain();
 
     let keys = h.reader.with(|conn| {
         repo::list_audit(

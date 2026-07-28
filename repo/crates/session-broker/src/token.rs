@@ -10,9 +10,29 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng as _;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Fill `dst` from the operating system's CSPRNG, or abort.
+///
+/// One function rather than a call at each site, because this is the INV-5
+/// boundary: every 256-bit token, the custody encryption key, each nonce, and
+/// every `state`/PKCE/nonce value comes from here, so "which RNG?" has exactly
+/// one answer to review.
+///
+/// **It panics if the OS RNG fails**, which is the whole point of not using the
+/// fallible API's `Result` here. `rand` 0.10 made `SysRng` fallible
+/// (`TryRng`), which is an improvement — it forces the question — but for this
+/// service the answer is not "handle it". A session token, or a key, built from
+/// anything other than full-strength entropy is worse than no session and worse
+/// than no key: it fails open, silently, and nothing downstream can tell.
+pub(crate) fn fill_random(dst: &mut [u8]) {
+    SysRng.try_fill_bytes(dst).expect(
+        "the OS CSPRNG is unavailable; refusing to mint secret material from a degraded source",
+    );
+}
 
 /// A cookie value in the clear. Zeroized on drop; deliberately has no `Display`,
 /// `Debug`, or `Serialize` impl that could leak it into a log line.
@@ -23,7 +43,7 @@ impl SessionToken {
     /// 32 bytes from the OS CSPRNG, base64url-encoded to 43 characters.
     pub fn generate() -> SessionToken {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        fill_random(&mut bytes);
         let encoded = URL_SAFE_NO_PAD.encode(bytes);
         bytes.zeroize();
         SessionToken(encoded)
