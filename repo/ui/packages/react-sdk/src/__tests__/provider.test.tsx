@@ -5,6 +5,7 @@ import { SessionProvider, useLeader, useSession, useSessionEvents } from '../pro
 import type { EventSourceFactory, EventSourceLike } from '../events.js';
 import type { LocksLike } from '../leader.js';
 import type { SessionMeta } from '../types.js';
+import { encodeMeta } from './base64url.js';
 
 /**
  * Same exclusive, FIFO-queued `navigator.locks` fake as leader.test.ts,
@@ -258,7 +259,7 @@ describe('SessionProvider events wiring', () => {
       absolute_until: Math.floor(Date.now() / 1000) + 100_000,
       custody: 'ok',
     };
-    document.cookie = `broker_meta=${Buffer.from(JSON.stringify(meta), 'utf-8').toString('base64url')}`;
+    document.cookie = `broker_meta=${encodeMeta(meta)}`;
 
     let source: ScriptableEventSource | null = null;
     const factory: EventSourceFactory = () => {

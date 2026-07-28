@@ -86,7 +86,9 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/audit", get(list_audit))
         .route(
             "/admin/observability",
-            get(get_observability).put(put_log_level).delete(restore_log_level),
+            get(get_observability)
+                .put(put_log_level)
+                .delete(restore_log_level),
         )
         .with_state(state)
 }
@@ -483,9 +485,9 @@ async fn list_audit(
         limit: params.limit.unwrap_or(200),
     };
 
-    let loaded = state
-        .reader
-        .with(|conn| repo::list_audit(conn, &query).and_then(|r| Ok((r, repo::audit_stats(conn)?))));
+    let loaded = state.reader.with(|conn| {
+        repo::list_audit(conn, &query).and_then(|r| Ok((r, repo::audit_stats(conn)?)))
+    });
     let (rows, stats) = match loaded {
         Ok(pair) => pair,
         Err(e) => {
@@ -596,10 +598,7 @@ async fn get_observability(State(state): State<AdminState>, headers: HeaderMap) 
         return *response;
     }
 
-    let stats = state
-        .reader
-        .with(repo::audit_stats)
-        .unwrap_or_default();
+    let stats = state.reader.with(repo::audit_stats).unwrap_or_default();
     let audit_config = state
         .audit
         .as_ref()

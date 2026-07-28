@@ -1,0 +1,30 @@
+# `cargo audit` configuration. CI runs `cargo audit --deny warnings`, so
+# everything here blocks a merge unless it is listed below WITH A REASON.
+#
+# An ignore entry is a decision, not a mute button. Each one states why the
+# advisory does not apply to this deployment and what would make it apply again.
+# An entry that cannot be written that way should not be written.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 — Marvin attack: key recovery through a timing
+  # sidechannel in `rsa` 0.9.x. Medium (5.9). **No fixed upgrade exists**, and
+  # the crate reaches us transitively through `openidconnect`, so there is
+  # nothing to bump to.
+  #
+  # Why it does not apply here: the attack needs an attacker-chosen ciphertext
+  # decrypted with an RSA PRIVATE key, and timing measured across many such
+  # operations. The broker holds no RSA private key. Its only RSA use is
+  # verifying the IdP's RS256 ID-token signature, which is a public-key
+  # operation and not what this advisory concerns.
+  #
+  # The one private key in the tree belongs to `crates/mock-idp`, which signs
+  # its fixture tokens. That crate is a DEV-DEPENDENCY and a test fixture that
+  # warns at startup it must never be deployed — it is not in the release
+  # binary's dependency graph.
+  #
+  # Revisit when: `openidconnect` moves to an `rsa` release carrying a fix, or
+  # the broker ever gains a private key of its own (it should not — issuing
+  # tokens is the IdP's job, and ADR-0001 says this service is not one).
+  "RUSTSEC-2023-0071",
+]

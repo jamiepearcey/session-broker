@@ -49,6 +49,77 @@ export interface IssuedKey {
   created_at: number;
 }
 
+/** One row of the durable audit record (ADR-0015). */
+export interface AuditRow {
+  seq: number;
+  at: number;
+  action: string;
+  outcome: "success" | "failure";
+  actor_kind: "admin" | "backend" | "user" | "system" | "anonymous";
+  actor_id: string | null;
+  subject: string | null;
+  sid: string | null;
+  custody_id: string | null;
+  key_id: string | null;
+  reason: string | null;
+  client_ip_prefix: string | null;
+  detail: Record<string, unknown> | null;
+}
+
+export interface AuditPage {
+  rows: AuditRow[];
+  /** Cursor for the next page; `null` at the end. */
+  next_before_seq: number | null;
+  retention_days: number;
+  rows_total: number;
+  oldest_at: number | null;
+  newest_at: number | null;
+  /** `audit.gap` rows in the window. Nonzero means the record is incomplete. */
+  gaps: number;
+}
+
+// `| undefined` is explicit because the console builds these objects with every
+// key present and some values `undefined` — under `exactOptionalPropertyTypes`,
+// "absent" and "present but undefined" are different types, and the alternative
+// is conditionally spreading eight keys at every call site.
+export interface AuditFilters {
+  since?: number | undefined;
+  until?: number | undefined;
+  action?: string | undefined;
+  subject?: string | undefined;
+  outcome?: string | undefined;
+  actor_kind?: string | undefined;
+  before_seq?: number | undefined;
+  limit?: number | undefined;
+}
+
+/** What the diagnostics plane is currently doing (ADR-0014). */
+export interface Observability {
+  log_format: string;
+  configured_filter: string;
+  effective_filter: string;
+  sinks: string[];
+  log_file: string | null;
+  log_file_rotation: string | null;
+  override_active: boolean;
+  override_expires_at: number | null;
+  override_requested_by: string | null;
+  override_max_secs: number;
+  metrics_path: string | null;
+  audit_retention_days: number;
+  audit_queue_capacity: number;
+  audit_queue_depth: number;
+  audit_coalesce_secs: number;
+  audit_subject_mode: string;
+  audit_record_rotations: boolean;
+  audit_rows: number;
+  audit_oldest_at: number | null;
+  audit_newest_at: number | null;
+  audit_gaps: number;
+  audit_dropped_total: number;
+  audit_failed_total: number;
+}
+
 /** Distinguishes "the broker said no" from "the broker is not there". */
 export class AdminError extends Error {
   constructor(
@@ -121,7 +192,51 @@ export const adminApi = {
   revokeSession: (sid: string) =>
     call<void>(`/sessions/${encodeURIComponent(sid)}`, { method: "DELETE" }),
   custody: () => call<Custody[]>("/custody"),
+  audit: (filters: AuditFilters = {}) => call<AuditPage>(`/audit${auditQuery(filters)}`),
+  observability: () => call<Observability>("/observability"),
+  setLogLevel: (filter: string, durationSecs: number) =>
+    call<{ filter: string; expires_at: number }>("/observability", {
+      method: "PUT",
+      body: JSON.stringify({ filter, duration_secs: durationSecs }),
+    }),
+  restoreLogLevel: () => call<void>("/observability", { method: "DELETE" }),
 };
+
+function auditQuery(filters: AuditFilters): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    // `0` is a legitimate epoch and a legitimate cursor, so the test is
+    // "supplied", not "truthy" — an `if (value)` here would silently drop them.
+    if (value !== undefined && value !== null && value !== "") {
+      params.set(key, String(value));
+    }
+  }
+  const encoded = params.toString();
+  return encoded ? `?${encoded}` : "";
+}
+
+/**
+ * The NDJSON export URL cannot be a plain link: the admin key lives in memory
+ * and travels in an `Authorization` header, so the browser's own navigation
+ * would arrive unauthenticated. Fetch it and hand the blob to a synthetic
+ * anchor instead.
+ */
+export async function downloadAuditNdjson(filters: AuditFilters): Promise<void> {
+  if (!adminKey) throw new AdminError(401, "no_key", "No admin key has been entered.");
+  const response = await fetch(`/admin/audit${auditQuery({ ...filters, limit: 1000 })}&format=ndjson`, {
+    headers: { authorization: `Bearer ${adminKey}` },
+  });
+  if (!response.ok) {
+    throw new AdminError(response.status, "export_failed", "The export could not be produced.");
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "session-broker-audit.ndjson";
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
 
 /** Unix seconds → a short absolute time. Absolute, not relative: an operator
  *  correlating with logs needs a timestamp, not "3 hours ago". */

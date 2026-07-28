@@ -1,0 +1,147 @@
+# Release builds, on a `v*` tag.
+#
+# ## What ships, and what deliberately does not
+#
+# Ships: the `session-broker` binary for linux x86_64 and aarch64, and the
+# console's built assets.
+#
+# Does NOT ship: `mock-idp`. It is a test fixture with no login UI, in-memory
+# keys, and a `/__test__/` control surface that can forge session state. It warns
+# at startup that it must never be deployed, and the surest way to honour that is
+# for it never to exist as a downloadable artifact next to the real thing.
+#
+# ## Why native runners rather than cross-compilation
+#
+# `rusqlite` is built with `bundled`, so every build compiles SQLite from C
+# source. Cross-compiling that means managing a cross toolchain to save a runner;
+# GitHub has arm64 runners, so the matrix just builds each target on its own
+# architecture and the C toolchain question disappears.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # So the artifact path can be exercised without cutting a tag first.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: Binary — ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repo
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        working-directory: repo
+        # `-p session-broker` rather than the whole workspace: see the header on
+        # why mock-idp must not end up in a release artifact.
+        run: cargo build --release -p session-broker
+
+      - name: Package
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          name="session-broker-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/session-broker "dist/$name/"
+          cp ../README.md ../docs/openapi.yaml "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          # Checksums alongside, so a deployment can verify what it fetched.
+          ( cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: session-broker-${{ matrix.target }}
+          path: repo/dist/*.tar.gz*
+          if-no-files-found: error
+
+  console:
+    name: Console assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: repo/ui/pnpm-lock.yaml
+
+      - name: Build
+        working-directory: repo/ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package
+        working-directory: repo/ui
+        run: |
+          set -euo pipefail
+          name="session-broker-console-${{ github.ref_name }}"
+          tar -C apps/console -czf "$name.tar.gz" dist
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: session-broker-console
+          path: repo/ui/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [binaries, console]
+    # Only a real tag produces a release; `workflow_dispatch` builds and stops,
+    # which is what makes it usable as a dry run.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            ## Before deploying
+
+            - The **internal listener** (`internal_bind_addr`) carries
+              `/internal/token`, `/authz`, `/admin/*` and `/metrics`. It must not
+              be internet-reachable. Every lane on it authenticates regardless,
+              because a bind address is a deployment promise rather than an
+              enforced invariant.
+            - Back up the **custody keyfile** together with the store file. The
+              keyfile decrypts every stored upstream refresh token; the database
+              is useless without it, and since ADR-0015 that database also holds
+              the audit record.
+            - Set `BROKER_LOG_FORMAT=json` anywhere a collector reads the logs,
+              and point Prometheus at `/metrics` on the internal listener. See
+              `docs/architecture/observability.md`.

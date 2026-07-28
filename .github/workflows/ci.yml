@@ -1,0 +1,177 @@
+# CI for session-broker.
+#
+# The repo is two build systems in one tree — a Cargo workspace at `repo/` and a
+# standalone pnpm workspace at `repo/ui/` that is deliberately NOT part of the
+# outer monorepo's workspace — so they are separate jobs that run in parallel.
+# Neither depends on the other's output: the broker serves no UI assets, and the
+# console talks to it over HTTP.
+#
+# What this gates on, and why each one is here rather than "because CI usually
+# has it":
+#
+#   fmt     — the tree is formatted; a fmt-only diff in a security review is
+#             noise that hides the change being reviewed.
+#   clippy  — `-D warnings`, the standard this crate was written to.
+#   test    — every invariant in `.context/invariants.md` maps to a test, so
+#             this job IS the invariant check. INV-12 (no secret material in
+#             telemetry) and INV-13 (no credential change without a committed
+#             audit row) live here.
+#   msrv    — `rust-version = "1.88"` is a claim in Cargo.toml. An unchecked
+#             MSRV claim rots within a release or two.
+#   audit   — this is `security/`. A known-vulnerable dependency in the service
+#             that holds every user's refresh token is a release blocker, not a
+#             backlog item, so this job blocks.
+#   openapi — `docs/openapi.yaml` is hand-written on purpose (what matters is
+#             which LISTENER each endpoint is on, which no generator infers), and
+#             hand-written means it can be invalid without anyone noticing.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # `cargo audit` finds advisories published after a commit lands, so the
+  # interesting failure is one nobody's push would have triggered.
+  schedule:
+    - cron: "17 6 * * 1"
+
+# A force-push or a quick second push should cancel the older run rather than
+# queue behind it — except on main, where every commit's result is a record.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in dependencies' build scripts too, and keep the log
+  # readable when a build does fail.
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: repo
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repo
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        # `--all-targets` so tests and benches are linted too. The crate was
+        # written clean under this and should stay that way.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        # `rusqlite` is built with `bundled`, so SQLite compiles from source
+        # here — that is why this job wants a C toolchain, which ubuntu-latest
+        # already has. No external services: `mock-idp` is an in-tree fixture
+        # and the store is a temp file.
+        run: cargo test --workspace
+
+  msrv:
+    name: Rust — MSRV 1.88
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: repo
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repo
+          key: msrv
+
+      # `check`, not `test`: the claim in Cargo.toml is that the crate compiles
+      # on 1.88, and re-running the whole suite on a second toolchain buys
+      # little for the minutes it costs.
+      - name: Check on the declared minimum
+        run: cargo check --workspace --all-targets
+
+  audit:
+    name: Rust — advisories
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: repo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  ui:
+    name: UI — typecheck, test, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: repo/ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          # The lockfile is inside `repo/ui`, not at the repo root — this is a
+          # standalone workspace, and setup-node looks at the root by default.
+          cache-dependency-path: repo/ui/pnpm-lock.yaml
+
+      - name: Install
+        # `--frozen-lockfile` so a PR that changes a dependency without
+        # committing the lockfile fails here rather than resolving to something
+        # nobody reviewed.
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        # Worth its own step rather than relying on `build`: the console's
+        # `build` script does run `tsc --noEmit` first, but a missing or renamed
+        # script would make that silently vacuous — which has happened in this
+        # house before.
+        run: pnpm typecheck
+
+      - name: Tests
+        # The SDK's vitest suite: meta parsing, single-flight collapse, 401
+        # retry-once, mocked-lock leader promotion.
+        run: pnpm test
+
+      - name: Build
+        # `pnpm -r build` in topological order, so `@session-broker/react` is
+        # built before the demo and console that consume it.
+        run: pnpm build
+
+  openapi:
+    name: Contract — OpenAPI 3.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Lint the contract
+        run: npx --yes @redocly/cli@latest lint docs/openapi.yaml

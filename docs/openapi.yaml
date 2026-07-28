@@ -48,6 +48,7 @@ info:
     on unsafe methods (ADR-0004), which the browser sets and script cannot forge.
   license:
     name: MIT OR Apache-2.0
+    identifier: MIT OR Apache-2.0
 
 servers:
   - url: https://app.example.com
@@ -64,6 +65,11 @@ tags:
     description: Backend token exchange (internal lane, dual authentication).
   - name: admin
     description: Key, session and custody management (internal lane).
+  - name: ops
+    description: |
+      Observability (internal lane). Two planes with different promises:
+      diagnostics are lossy and shipped by the deployment, the audit record is
+      durable and queryable here. See ADR-0014 and ADR-0015.
 
 paths:
   /healthz:
@@ -259,7 +265,7 @@ paths:
                     type: string
                     description: The IdP subject. Opaque — map it to your own user model.
                   expires_at: { type: integer, description: Unix seconds. }
-                  scope: { type: string, nullable: true }
+                  scope: { type: [string, "null"] }
         "401":
           description: |
             `missing_api_key` / `bad_api_key` — the CALLER's credential is wrong;
@@ -414,6 +420,154 @@ paths:
                 items: { $ref: "#/components/schemas/Custody" }
         "401": { $ref: "#/components/responses/AdminUnauthorised" }
 
+  /admin/audit:
+    get:
+      tags: [admin]
+      summary: The durable audit record.
+      description: |
+        Read from the broker's own store, not the log pipeline (ADR-0015) — so
+        it answers even when a collector is misconfigured, which is precisely
+        when an audit question gets asked.
+
+        **What is deliberately absent.** Edge authorisation (`/authz`) and
+        session refresh produce no rows, on success or refusal. They change
+        nothing, so they are not history; they are counters on `/metrics`. This
+        is what keeps the platform's per-request path free of a store write.
+
+        **The window is bounded** (`audit_retention_days`, default 90) and Tier-B
+        events can be dropped under pressure. `rows_total`, `oldest_at` and
+        `gaps` are returned on every page so an empty result can never be
+        mistaken for "nothing happened": where `gaps > 0`, the absence of a row
+        is not evidence of absence.
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { name: since, in: query, schema: { type: integer }, description: "Epoch seconds, inclusive." }
+        - { name: until, in: query, schema: { type: integer }, description: "Epoch seconds, inclusive." }
+        - name: action
+          in: query
+          schema: { type: string }
+          description: "Prefix match, so `key.` finds both `key.issued` and `key.revoked`."
+        - { name: subject, in: query, schema: { type: string }, description: Exact match. }
+        - { name: outcome, in: query, schema: { type: string, enum: [success, failure] } }
+        - { name: actor_kind, in: query, schema: { type: string, enum: [admin, backend, user, system, anonymous] } }
+        - name: before_seq
+          in: query
+          schema: { type: integer }
+          description: |
+            Descending cursor. A `seq` cursor rather than an offset because rows
+            are only ever appended and pruned — an offset would drift.
+        - { name: limit, in: query, schema: { type: integer, default: 200, maximum: 1000 } }
+        - name: format
+          in: query
+          schema: { type: string, enum: [ndjson] }
+          description: "`ndjson` returns one JSON object per line for export; anything else returns the envelope."
+      responses:
+        "200":
+          description: A page of the record, plus the window it came from.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditPage" }
+            application/x-ndjson:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+
+  /admin/observability:
+    get:
+      tags: [admin]
+      summary: What the diagnostics and audit planes are currently doing.
+      description: |
+        Reports configuration; it does not let you change most of it. Sinks,
+        retention, redaction and the audit tiers are deployment config applied at
+        restart, because a console holding the admin key must not be able to
+        redirect or silence the audit stream (ADR-0015).
+      security: [{ adminApiKey: [] }]
+      responses:
+        "200":
+          description: Current state of both planes.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Observability" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+    put:
+      tags: [admin]
+      summary: Raise diagnostic verbosity for a bounded window.
+      description: |
+        The **only** runtime-mutable part of the observability configuration, and
+        the deadline is the point: a level switch with no expiry is a level
+        switch that stays on, and this service logs on the platform's per-request
+        path. The broker restores the configured filter itself when the window
+        closes.
+
+        Rejected before it is applied if the directive would not parse — a filter
+        that failed open would log everything. Audited, because turning the
+        lights down is itself a security-relevant act.
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filter, duration_secs]
+              properties:
+                filter:
+                  type: string
+                  description: |
+                    An `EnvFilter` directive, not merely a level —
+                    `session_broker::keepalive=trace` is the shape wanted during
+                    an incident.
+                  example: session_broker=info,broker::authz=debug
+                duration_secs:
+                  type: integer
+                  description: Bounded by `log_level_override_max_secs` (default 3600).
+                  example: 900
+      responses:
+        "200":
+          description: Applied, with the deadline it will restore itself at.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  filter: { type: string }
+                  expires_at: { type: integer }
+        "400":
+          description: "`bad_filter` — would not parse. `duration_out_of_range` — zero, or past the ceiling."
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501":
+          description: "`no_log_control` — this process did not install its own subscriber."
+    delete:
+      tags: [admin]
+      summary: Restore the configured filter now.
+      description: Idempotent — restoring when nothing is overridden is a no-op, not an error.
+      security: [{ adminApiKey: [] }]
+      responses:
+        "204": { description: "Restored, or there was nothing to restore." }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus text exposition (internal lane).
+      description: |
+        **Unauthenticated, by decision.** Scrape configs manage bearer tokens
+        badly and a silently-rotated one breaks the monitoring that would have
+        told you it broke. The listener's network position is the control — the
+        same posture that already guards `/internal/token` next door, which is a
+        far larger problem if this listener is reachable from somewhere it should
+        not be.
+
+        Carries counts and latencies only: no `sub`, no `sid`, and route labels
+        are matched axum patterns rather than raw paths (INV-12).
+
+        Absent entirely when `metrics_enabled=false`.
+      responses:
+        "200":
+          description: Prometheus text format 0.0.4.
+          content:
+            text/plain:
+              schema: { type: string }
+
 components:
   securitySchemes:
     sessionCookie:
@@ -477,9 +631,9 @@ components:
         key_id: { type: string }
         name: { type: string }
         created_at: { type: integer }
-        created_by: { type: string, nullable: true }
-        last_used_at: { type: integer, nullable: true }
-        revoked_at: { type: integer, nullable: true }
+        created_by: { type: [string, "null"] }
+        last_used_at: { type: [integer, "null"] }
+        revoked_at: { type: [integer, "null"] }
         live:
           type: boolean
           description: Derived from `revoked_at`, so the console and the token lane cannot disagree about what "live" means.
@@ -505,6 +659,101 @@ components:
         next_refresh: { type: integer }
         fail_count: { type: integer }
 
+    AuditRow:
+      type: object
+      description: |
+        One immutable row. `seq` is `AUTOINCREMENT` and never reused, even after
+        a retention prune — so it is a stable cursor AND a gap in it reads as
+        evidence rather than ambiguity.
+      required: [seq, at, action, outcome, actor_kind]
+      properties:
+        seq: { type: integer }
+        at: { type: integer, description: Epoch seconds. }
+        action:
+          type: string
+          description: |
+            Stable dotted name. Catalogue in
+            `docs/architecture/observability.md` §4.
+          example: key.issued
+        outcome: { type: string, enum: [success, failure] }
+        actor_kind: { type: string, enum: [admin, backend, user, system, anonymous] }
+        actor_id: { type: [string, "null"], description: "A `key_id`, a subject, or null." }
+        subject: { type: [string, "null"], description: Whose data was acted on. }
+        sid: { type: [string, "null"] }
+        custody_id: { type: [string, "null"] }
+        key_id: { type: [string, "null"] }
+        reason: { type: [string, "null"], description: "The refusal code, on failure." }
+        client_ip_prefix:
+          type: [string, "null"]
+          description: A /24 or /48 prefix. Never a full address (INV-12).
+          example: 203.0.113.0/24
+        detail:
+          type: [object, "null"]
+          description: Non-secret structured context.
+
+    AuditPage:
+      type: object
+      required: [rows, retention_days, rows_total, gaps]
+      properties:
+        rows:
+          type: array
+          items: { $ref: "#/components/schemas/AuditRow" }
+        next_before_seq:
+          type: [integer, "null"]
+          description: Cursor for the next page; null at the end.
+        retention_days: { type: integer, description: "0 means rows are kept forever." }
+        rows_total: { type: integer }
+        oldest_at:
+          type: [integer, "null"]
+          description: |
+            Null when the table is empty — which is how a client tells "no
+            history yet" from "history since 1970".
+        newest_at: { type: [integer, "null"] }
+        gaps:
+          type: integer
+          description: |
+            `audit.gap` rows in the window. NONZERO means events were dropped at
+            the queue bound, and for the periods those markers cover the absence
+            of a row is not evidence of absence.
+
+    Observability:
+      type: object
+      description: |
+        Everything reported here is deployment config except
+        `effective_filter`/`override_*`, which is the one runtime-mutable part.
+      properties:
+        log_format: { type: string, enum: [text, json, unknown] }
+        configured_filter: { type: string }
+        effective_filter: { type: string, description: Differs from configured while an override is in force. }
+        sinks: { type: array, items: { type: string } }
+        log_file: { type: [string, "null"] }
+        log_file_rotation:
+          type: [string, "null"]
+          description: |
+            Rotation only. The broker never deletes a file it has closed —
+            pruning is logrotate's job or the volume's.
+        override_active: { type: boolean }
+        override_expires_at: { type: [integer, "null"] }
+        override_requested_by: { type: [string, "null"] }
+        override_max_secs: { type: integer }
+        metrics_path: { type: [string, "null"] }
+        audit_retention_days: { type: integer }
+        audit_queue_capacity: { type: integer }
+        audit_queue_depth: { type: integer }
+        audit_coalesce_secs: { type: integer }
+        audit_subject_mode: { type: string, enum: [plain, hashed] }
+        audit_record_rotations: { type: boolean }
+        audit_rows: { type: integer }
+        audit_oldest_at: { type: [integer, "null"] }
+        audit_newest_at: { type: [integer, "null"] }
+        audit_gaps: { type: integer }
+        audit_dropped_total:
+          type: integer
+          description: Since boot. Alert on any increase — the record has a hole.
+        audit_failed_total:
+          type: integer
+          description: Tier-A writes that failed, each of which refused an admin operation.
+
     ApiError:
       type: object
       description: The public lane's error shape.
@@ -512,8 +761,7 @@ components:
         code: { type: string }
         message: { type: string }
         login_url:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: Where to send the browser to re-authenticate, so the SDK never builds one itself.
 
     LaneError:

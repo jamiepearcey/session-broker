@@ -236,8 +236,8 @@ impl LogControl {
                 max: self.config.override_max_secs,
             });
         }
-        let parsed =
-            EnvFilter::try_new(filter).map_err(|_| LogControlError::BadFilter(filter.to_owned()))?;
+        let parsed = EnvFilter::try_new(filter)
+            .map_err(|_| LogControlError::BadFilter(filter.to_owned()))?;
 
         self.reload
             .reload(parsed)
@@ -317,13 +317,14 @@ pub fn init(config: LogConfig) -> Result<std::sync::Arc<LogControl>, String> {
     let mut guards = Vec::new();
     let mut layers: Vec<Box<dyn Layer<Filtered> + Send + Sync>> = Vec::new();
 
-    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-        .buffered_lines_limit(config.queue_capacity)
-        // Lossy: under pressure, drop lines rather than block the caller. On the
-        // /authz path "block the caller" means blocking a platform request on a
-        // log write, which is never the right trade.
-        .lossy(true)
-        .finish(std::io::stdout());
+    let (stdout_writer, stdout_guard) =
+        tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(config.queue_capacity)
+            // Lossy: under pressure, drop lines rather than block the caller. On the
+            // /authz path "block the caller" means blocking a platform request on a
+            // log write, which is never the right trade.
+            .lossy(true)
+            .finish(std::io::stdout());
     guards.push(stdout_guard);
     layers.push(fmt_layer(config.format, stdout_writer));
 
@@ -350,10 +351,11 @@ pub fn init(config: LogConfig) -> Result<std::sync::Arc<LogControl>, String> {
                 file_name,
             ),
         };
-        let (file_writer, file_guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-            .buffered_lines_limit(config.queue_capacity)
-            .lossy(true)
-            .finish(appender);
+        let (file_writer, file_guard) =
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(config.queue_capacity)
+                .lossy(true)
+                .finish(appender);
         guards.push(file_guard);
         // The file sink is always JSON regardless of `log_format`: a file exists
         // to be parsed later by something, whereas the console format exists to

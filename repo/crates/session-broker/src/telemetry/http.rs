@@ -42,13 +42,20 @@ use super::metrics::Metrics;
 /// Takes and returns the `Router` rather than handing back a layer, because
 /// naming the type of a `from_fn` closure is worse than the problem it solves.
 pub fn instrument_router(router: Router, lane: &'static str, metrics: Arc<Metrics>) -> Router {
-    router.layer(axum::middleware::from_fn(move |req: Request, next: Next| {
-        let metrics = metrics.clone();
-        async move { instrument(lane, metrics, req, next).await }
-    }))
+    router.layer(axum::middleware::from_fn(
+        move |req: Request, next: Next| {
+            let metrics = metrics.clone();
+            async move { instrument(lane, metrics, req, next).await }
+        },
+    ))
 }
 
-async fn instrument(lane: &'static str, metrics: Arc<Metrics>, req: Request, next: Next) -> Response {
+async fn instrument(
+    lane: &'static str,
+    metrics: Arc<Metrics>,
+    req: Request,
+    next: Next,
+) -> Response {
     // Owned before the await: see the module docs on the `&Request` trap.
     let route = req
         .extensions()

@@ -43,7 +43,9 @@ pub struct Histogram {
 impl Histogram {
     fn new() -> Histogram {
         Histogram {
-            buckets: (0..LATENCY_BUCKETS.len()).map(|_| AtomicU64::new(0)).collect(),
+            buckets: (0..LATENCY_BUCKETS.len())
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             sum_micros: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
@@ -88,10 +90,7 @@ impl<T> Family<T> {
         // Read guard released before the write lock is taken.
         let key: Vec<String> = labels.iter().map(|s| (*s).to_owned()).collect();
         let mut guard = self.inner.write().expect("metrics family lock poisoned");
-        guard
-            .entry(key)
-            .or_insert_with(|| Arc::new(make()))
-            .clone()
+        guard.entry(key).or_insert_with(|| Arc::new(make())).clone()
     }
 
     fn snapshot(&self) -> Vec<(Vec<String>, Arc<T>)> {
@@ -152,7 +151,13 @@ impl Metrics {
     /// `lane` is `public`, `internal` or `admin`; `route` is the *matched* axum
     /// path pattern, never the raw URI — a raw path carries `return_to` and
     /// `code` (INV-12) and would blow cardinality apart besides.
-    pub fn record_request(&self, lane: &str, route: &str, status: u16, elapsed: std::time::Duration) {
+    pub fn record_request(
+        &self,
+        lane: &str,
+        route: &str,
+        status: u16,
+        elapsed: std::time::Duration,
+    ) {
         let status = status.to_string();
         self.http_requests
             .get_or_insert(&[lane, route, &status], || AtomicU64::new(0))
@@ -304,7 +309,12 @@ impl Metrics {
             &self.audit_recorded,
         );
 
-        gauge(&mut out, "broker_sessions_live", "Live sessions.", gauges.sessions_live as f64);
+        gauge(
+            &mut out,
+            "broker_sessions_live",
+            "Live sessions.",
+            gauges.sessions_live as f64,
+        );
         gauge(
             &mut out,
             "broker_generations_live",
@@ -501,7 +511,12 @@ mod tests {
         assert!(LATENCY_BUCKETS[0] < 0.001);
 
         let m = Metrics::new();
-        m.record_request("public", "/session/refresh", 200, std::time::Duration::from_micros(80));
+        m.record_request(
+            "public",
+            "/session/refresh",
+            200,
+            std::time::Duration::from_micros(80),
+        );
         let text = m.render(&GaugeSnapshot::default());
 
         assert!(
@@ -524,7 +539,8 @@ mod tests {
 
         let text = m.render(&GaugeSnapshot::default());
         assert!(text.contains("broker_authz_decisions_total{decision=\"allow\",reason=\"ok\"} 2"));
-        assert!(text.contains("broker_authz_decisions_total{decision=\"deny\",reason=\"no_session\"} 1"));
+        assert!(text
+            .contains("broker_authz_decisions_total{decision=\"deny\",reason=\"no_session\"} 1"));
     }
 
     #[test]

@@ -76,13 +76,10 @@ impl Harness {
     /// on its ack. Batches apply strictly in order, so anything enqueued before
     /// this has already committed when it returns.
     fn flush(&self) {
-        let _ = self
-            .writer
-            .handle()
-            .write_admin(AdminWrite::TouchApiKey {
-                key_id: "does-not-exist".to_owned(),
-                now: T0,
-            });
+        let _ = self.writer.handle().write_admin(AdminWrite::TouchApiKey {
+            key_id: "does-not-exist".to_owned(),
+            now: T0,
+        });
     }
 }
 
@@ -176,9 +173,14 @@ fn overflowing_the_tier_b_queue_leaves_a_gap_marker_not_a_silence() {
 
     for i in 0..200 {
         h.sink.record(
-            Event::new(action::LOGIN_FAILED, Outcome::Failure, ActorKind::Anonymous, T0)
-                .reason("bad_state")
-                .detail(serde_json::json!({ "i": i })),
+            Event::new(
+                action::LOGIN_FAILED,
+                Outcome::Failure,
+                ActorKind::Anonymous,
+                T0,
+            )
+            .reason("bad_state")
+            .detail(serde_json::json!({ "i": i })),
         );
     }
     h.flush();
@@ -189,7 +191,10 @@ fn overflowing_the_tier_b_queue_leaves_a_gap_marker_not_a_silence() {
 
     let rows = h.rows();
     let dropped = h.metrics.audit_dropped_total();
-    assert!(dropped > 0, "capacity 1 under a burst of 200 must drop some");
+    assert!(
+        dropped > 0,
+        "capacity 1 under a burst of 200 must drop some"
+    );
     assert!(
         rows.len() < 200,
         "and the record must be genuinely short: {} rows",
@@ -239,19 +244,23 @@ fn token_exchanges_coalesce_per_key_and_session_but_never_across_them() {
 
     assert!(h.sink.should_record_exchange("bk_1", "sid_1", T0));
     assert!(
-        !h.sink.should_record_exchange("bk_1", "sid_1", T0.plus_secs(299)),
+        !h.sink
+            .should_record_exchange("bk_1", "sid_1", T0.plus_secs(299)),
         "the same backend acting for the same user inside the window adds no fact"
     );
     assert!(
-        h.sink.should_record_exchange("bk_1", "sid_2", T0.plus_secs(1)),
+        h.sink
+            .should_record_exchange("bk_1", "sid_2", T0.plus_secs(1)),
         "a DIFFERENT user is a different fact and must never be collapsed"
     );
     assert!(
-        h.sink.should_record_exchange("bk_2", "sid_1", T0.plus_secs(1)),
+        h.sink
+            .should_record_exchange("bk_2", "sid_1", T0.plus_secs(1)),
         "a different backend likewise"
     );
     assert!(
-        h.sink.should_record_exchange("bk_1", "sid_1", T0.plus_secs(301)),
+        h.sink
+            .should_record_exchange("bk_1", "sid_1", T0.plus_secs(301)),
         "and the window reopens"
     );
 }
@@ -284,8 +293,13 @@ fn hashed_subject_mode_pseudonymises_people_but_not_credentials() {
     // Stable, or correlation across rows would be impossible and the mode
     // would be useless rather than merely private.
     let again = h.sink.transactional(
-        Event::new(action::SESSION_CREATED, Outcome::Success, ActorKind::User, T0)
-            .subject("alice@example.com"),
+        Event::new(
+            action::SESSION_CREATED,
+            Outcome::Success,
+            ActorKind::User,
+            T0,
+        )
+        .subject("alice@example.com"),
     );
     assert_eq!(row.subject, again.subject);
 }
@@ -300,15 +314,20 @@ fn no_builder_method_can_put_secret_material_in_a_row() {
 
     // Everything an emitting site is allowed to attach, all at once.
     let row = h.sink.transactional(
-        Event::new(action::TOKEN_EXCHANGED, Outcome::Success, ActorKind::Backend, T0)
-            .actor_id("bk_1")
-            .key_id("bk_1")
-            .subject("user-1")
-            .sid("sid-1")
-            .custody_id("cust-1")
-            .reason("ok")
-            .client_ip_prefix("203.0.113.0/24")
-            .detail(serde_json::json!({ "name": "envoy-edge" })),
+        Event::new(
+            action::TOKEN_EXCHANGED,
+            Outcome::Success,
+            ActorKind::Backend,
+            T0,
+        )
+        .actor_id("bk_1")
+        .key_id("bk_1")
+        .subject("user-1")
+        .sid("sid-1")
+        .custody_id("cust-1")
+        .reason("ok")
+        .client_ip_prefix("203.0.113.0/24")
+        .detail(serde_json::json!({ "name": "envoy-edge" })),
     );
 
     let serialised = format!("{row:?}");
@@ -408,13 +427,13 @@ fn zero_retention_days_prunes_nothing() {
 #[test]
 fn action_filters_match_by_prefix_without_treating_underscores_as_wildcards() {
     let h = harness("filter", AuditConfig::default());
-    for action in [action::KEY_ISSUED, action::KEY_REVOKED, action::LOGIN_FAILED] {
-        h.sink.record(Event::new(
-            action,
-            Outcome::Success,
-            ActorKind::Admin,
-            T0,
-        ));
+    for action in [
+        action::KEY_ISSUED,
+        action::KEY_REVOKED,
+        action::LOGIN_FAILED,
+    ] {
+        h.sink
+            .record(Event::new(action, Outcome::Success, ActorKind::Admin, T0));
     }
     h.flush();
     std::thread::sleep(std::time::Duration::from_millis(150));

@@ -1,0 +1,42 @@
+# Dependency updates.
+#
+# Grouped rather than one PR per crate: this repo has ~320 transitive
+# dependencies, and a review queue of forty single-bump PRs is a queue nobody
+# reads — which is the failure mode Dependabot is supposed to prevent. Security
+# updates are deliberately left ungrouped so they arrive alone and obvious.
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /repo
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor-and-patch:
+        update-types: [minor, patch]
+    # Majors arrive as their own PR: for this service a major bump of
+    # `openidconnect`, `axum` or `rusqlite` is a change to a security boundary,
+    # not a routine update.
+
+  - package-ecosystem: npm
+    # The UI is a STANDALONE pnpm workspace, deliberately not part of the outer
+    # monorepo's — so the manifest path is here, not at the repo root.
+    directory: /repo/ui
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      ui-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
