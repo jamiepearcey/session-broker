@@ -1,6 +1,12 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* The design tokens stay in `tailwind.config.ts` rather than moving to v4's
+   CSS-first `@theme`. `@config` is v4's supported path for exactly this, and
+   the token set here — the quant-dark palette, the OPAQUE `--surface-warn` /
+   `--surface-danger` callout surfaces — is the part of this console most
+   easily broken by a mechanical rewrite. Migrating it is a separate change
+   with its own visual review, not a side effect of a version bump. */
+@config "../tailwind.config.ts";
 
 @layer base {
   :root {
