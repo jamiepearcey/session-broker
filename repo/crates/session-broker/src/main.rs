@@ -146,7 +146,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         clock.clone(),
         Arc::new(RandJitter),
         upstream,
-    );
+    )
+    .with_observability(metrics.clone(), Some(audit.clone()))
+    .with_durability(writer_handle.clone());
     let scheduled = restore_keepalive_schedule(&reader, &mut worker, now);
     tracing::info!(custodies = scheduled, "keepalive schedule rebuilt");
     tokio::spawn(run_keepalive(worker, schedule_rx));

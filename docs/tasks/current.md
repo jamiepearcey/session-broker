@@ -103,23 +103,32 @@ Milestones are defined in
   failure-path controls have not been exercised against a running broker —
   only against mocked `fetch`/`navigator.locks` in the SDK's own tests.
 
-## Known gaps in the observability work, stated plainly
+## Closed since (2026-07-28)
 
-- **Custody transitions are not audited yet.** `custody.degraded` / `custody.dead`
-  / `custody.revoked_upstream` are in the catalogue and the console filters for
-  them, but `keepalive.rs` does not hold an `AuditSink`, so no rows are written.
-  The status change is visible in `broker_custody{status}` and in the Custody
-  view meanwhile.
-- **`login.failed` is not emitted.** The callback's failure paths all funnel
-  through one `error_redirect` that does not carry the reason, so recording it
-  would mean threading the `OauthError` back out first.
-- **Keepalive has no metrics.** `broker_keepalive_refresh_total` and
-  `broker_keepalive_upstream_duration_seconds` are declared and rendered but
-  never observed, for the same reason: the worker holds no `Metrics`.
-- **No log-sink redaction test.** INV-12 is verified against audit rows (a real
-  test) and was checked by hand against a live log stream during verification,
-  but there is no automated test that captures the subscriber's output and greps
-  it. That is the one INV-12 claim still resting on inspection.
+- [x] **The observability gaps are closed.** `custody.degraded`/`custody.dead`/
+      `custody.revoked_upstream` are emitted by the keepalive worker, once per
+      TRANSITION rather than per retry (a guard with its own mutation-tested
+      case: 4 rows without it, 1 with). `login.failed` is emitted with a stable
+      low-cardinality `OauthError::code()` rather than its `Display`, which
+      carries attacker-influenced provider strings. `broker_keepalive_*` metrics
+      are observed. INV-12 now has a **log-stream** test, not just a row test.
+
+- [x] **Two real bugs the new tests found, both fixed:**
+      1. `AuditSink::emit_to_log` dropped `client_ip_prefix` and `detail`, so the
+         log-stream archive was strictly poorer than the store's own copy —
+         which falsified ADR-0014's claim that the stream *is* the long-term
+         archive.
+      2. **Custody failures were never persisted.** Nothing sent
+         `CustodyWrite::Failure`, so `repo::update_custody_failure` was
+         unreachable and the durable row never left `status='ok',
+         fail_count=0`. Consequences: `live_custody_schedules`' `status != 'dead'`
+         filter could never match, so a dead grant was restored alive with its
+         backoff reset; and `/admin/custody`, the Custody console view and the
+         new `broker_custody{status}` gauge all reported healthy grants that were
+         not. The worker now persists health and backoff on every failure,
+         fire-and-forget (no token rotates on a failure, so §6's write-through
+         hazard does not apply, and an ack per failure would serialise the whole
+         fleet behind one fsync during an outage).
 
 ## Deferred
 

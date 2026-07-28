@@ -102,3 +102,123 @@ fn a_verbosity_override_is_bounded_and_expires_on_its_own() {
     // operators pressing "restore now" must not produce a failure.
     assert!(!control.restore().unwrap());
 }
+
+/// INV-12, enforced against the LOG STREAM rather than by inspection.
+///
+/// The audit-row half of this invariant already has a test
+/// (`audit::tests::no_builder_method_can_put_secret_material_in_a_row`). This is
+/// the half that was still resting on a hand check: audit events are *also*
+/// emitted to `broker::audit` (ADR-0014's fail-open archive path), and that path
+/// formats every field itself. A row can be clean while the line beside it is
+/// not.
+///
+/// It works by installing a scoped subscriber over an in-memory writer rather
+/// than calling `init`, which is process-global and single-shot.
+#[test]
+fn no_secret_material_reaches_the_log_stream() {
+    use crate::audit::{ActorKind, AuditConfig, AuditSink, Event, Outcome};
+    use crate::clock::Timestamp;
+    use crate::store::writer::Writer;
+    use std::sync::{Arc, Mutex};
+
+    /// A `MakeWriter` over a shared buffer, so the test can read back exactly
+    /// the bytes a real sink would have received.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    // Fixtures shaped like the real thing, so a substring match is meaningful.
+    const COOKIE: &str = "S3cr3tCookieValue_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const ACCESS_TOKEN: &str = "at_S3cr3tAccessToken_bbbbbbbbbbbbbbbbbbbb";
+    const REFRESH_TOKEN: &str = "rt_S3cr3tRefreshToken_cccccccccccccccccc";
+    const API_KEY: &str = "sk_S3cr3tApiKeySecret_dddddddddddddddddddd";
+    const PKCE_VERIFIER: &str = "pkce_S3cr3tVerifier_eeeeeeeeeeeeeeeeeeee";
+
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(captured.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let conn = crate::store::open_in_memory().unwrap();
+        let writer = Writer::spawn(conn);
+        let sink = AuditSink::new(writer.handle(), Metrics::new(), AuditConfig::default());
+
+        // Drive both tiers, with every builder field populated. If a future
+        // field ever forwards raw material into the log line, one of these
+        // assertions is what catches it.
+        let event = || {
+            Event::new(
+                crate::audit::action::TOKEN_EXCHANGED,
+                Outcome::Success,
+                ActorKind::Backend,
+                Timestamp(1_700_000_000),
+            )
+            .actor_id("bk_visible")
+            .key_id("bk_visible")
+            .subject("user-1")
+            .sid("sid-visible")
+            .custody_id("cust-visible")
+            .reason("ok")
+            .client_ip_prefix("203.0.113.0/24")
+            .detail(serde_json::json!({ "name": "envoy-edge" }))
+        };
+        sink.record(event());
+        let _ = sink.transactional(event());
+
+        // And the ordinary log paths that sit closest to credential material.
+        tracing::info!(target: "broker::http", lane = "public", route = "/session/refresh", status = 200, "request");
+        tracing::warn!(target: "broker::authz", reason = "session_not_active", "denied");
+
+        drop(writer);
+    });
+
+    let bytes = captured.0.lock().unwrap().clone();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.is_empty(), "the capture harness itself must work");
+
+    for (label, secret) in [
+        ("session cookie", COOKIE),
+        ("upstream access token", ACCESS_TOKEN),
+        ("upstream refresh token", REFRESH_TOKEN),
+        ("api key secret", API_KEY),
+        ("pkce verifier", PKCE_VERIFIER),
+    ] {
+        assert!(
+            !text.contains(secret),
+            "INV-12: {label} reached the log stream:\n{text}"
+        );
+    }
+
+    // A full client address must not survive either — only the prefix.
+    assert!(
+        !text.contains("203.0.113.42"),
+        "INV-12: a full client IP was logged"
+    );
+
+    // The identifiers that ARE permitted must be present, or this test would
+    // pass just as well against a subscriber that emitted nothing at all.
+    assert!(
+        text.contains("sid-visible"),
+        "permitted identifiers must still be logged"
+    );
+    assert!(text.contains("bk_visible"));
+    assert!(text.contains("203.0.113.0/24"));
+}

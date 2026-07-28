@@ -107,11 +107,15 @@ pub async fn callback(
         // INV-3a: no txn cookie at all. Nothing was ever created for this
         // request, so there is nothing to discard — straight to the error
         // page, no session.
-        None => error_redirect(&state.config),
+        None => {
+            record_login_failure(&state, "no_txn_cookie", now);
+            error_redirect(&state.config)
+        }
         Some(id) => match resolve(&oidc, id, &query, now).await {
             Ok((tokens, return_to)) => success_response(&state, tokens, return_to, now),
             Err(error) => {
                 tracing::warn!(%error, "oauth callback failed");
+                record_login_failure(&state, error.code(), now);
                 error_redirect(&state.config)
             }
         },
@@ -210,6 +214,29 @@ fn success_response(
         append_cookie(&mut response, cookie);
     }
     response
+}
+
+/// Record a failed login (ADR-0015, Tier B).
+///
+/// Audited even though no subject is known — that is the point. A run of
+/// `state_mismatch` or `unknown_txn` with no successful login between them is
+/// what a replay or a CSRF-on-login attempt looks like from the server, and it
+/// is invisible if only successes are recorded.
+///
+/// The `reason` is [`OauthError::code`], not its `Display`: the latter carries
+/// provider-supplied strings, which are attacker-influenced and would make the
+/// column impossible to group by.
+fn record_login_failure(state: &AppState, reason: &'static str, now: crate::clock::Timestamp) {
+    let Some(sink) = &state.audit else { return };
+    sink.record(
+        crate::audit::Event::new(
+            crate::audit::action::LOGIN_FAILED,
+            crate::audit::Outcome::Failure,
+            crate::audit::ActorKind::Anonymous,
+            now,
+        )
+        .reason(reason),
+    );
 }
 
 /// `/auth/*`'s failure destination. `HttpConfig` carries no configurable

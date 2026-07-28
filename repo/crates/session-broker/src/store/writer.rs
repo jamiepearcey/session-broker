@@ -259,6 +259,40 @@ impl WriterHandle {
             .map_err(|_| "writer thread is gone".to_owned())
     }
 
+    /// Persist a custody's health and backoff after a FAILED refresh.
+    ///
+    /// Fire-and-forget, deliberately unlike [`WriterHandle::write_custody`].
+    /// The write-through rule in §6 exists for the irreplaceable refresh token:
+    /// the worker must not believe a rotated one is durable until it is. A
+    /// failure rotates nothing — only `status`, `fail_count` and `next_refresh`
+    /// move — so the hazard does not apply, and losing the last one in a crash
+    /// costs a single retry on a stale schedule.
+    ///
+    /// Blocking here would be actively worse: during an upstream outage every
+    /// custody in the fleet fails at once, and an ack per failure would
+    /// serialise the whole fleet's failure handling behind one fsync at exactly
+    /// the moment the worker has the most to do.
+    pub fn enqueue_custody_failure(
+        &self,
+        custody_id: CustodyId,
+        status: CustodyStatus,
+        fail_count: i64,
+        next_refresh: Timestamp,
+        now: Timestamp,
+    ) {
+        let (ack_tx, _ack_rx) = mpsc::channel();
+        let _ = self.tx.send(Command::Custody(
+            CustodyWrite::Failure {
+                custody_id,
+                status,
+                fail_count,
+                next_refresh,
+                now,
+            },
+            ack_tx,
+        ));
+    }
+
     /// Write-through admin mutation. `Ok(false)` means the row was not there to
     /// change — a 404, not a failure.
     pub fn write_admin(&self, write: AdminWrite) -> Result<bool, String> {
