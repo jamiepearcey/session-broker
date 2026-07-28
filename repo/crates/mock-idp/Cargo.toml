@@ -31,7 +31,7 @@ jsonwebtoken.workspace = true
 # excluded from every release artifact, so the older RNG never ships.
 #
 # Revisit when `rsa` moves to rand_core 0.9+.
-rand = "0.8"
+rand = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

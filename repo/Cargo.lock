@@ -1369,7 +1369,7 @@ dependencies = [
  "chrono",
  "clap",
  "jsonwebtoken",
- "rand 0.8.7",
+ "rand 0.10.2",
  "reqwest",
  "rsa",
  "serde",
