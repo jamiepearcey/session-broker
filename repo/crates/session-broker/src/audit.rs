@@ -454,6 +454,12 @@ impl AuditSink {
             key_id = row.key_id.as_deref().unwrap_or("-"),
             custody_id = row.custody_id.as_deref().unwrap_or("-"),
             reason = row.reason.as_deref().unwrap_or("-"),
+            // Every column the store keeps, or the claim that the log stream is
+            // the long-term ARCHIVE (ADR-0014) is false: a SIEM would hold a
+            // strictly poorer record than the broker's own 90-day window, and
+            // the fields it lost would be the ones nobody noticed were missing.
+            client_ip_prefix = row.client_ip_prefix.as_deref().unwrap_or("-"),
+            detail = row.detail.as_deref().unwrap_or("-"),
             "audit"
         );
     }

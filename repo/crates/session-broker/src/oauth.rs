@@ -96,6 +96,29 @@ pub enum OauthError {
     InvalidIdToken(String),
 }
 
+impl OauthError {
+    /// A stable, low-cardinality code for the audit record and for metrics.
+    ///
+    /// Deliberately NOT `Display`: that carries provider strings and URLs,
+    /// which are attacker-influenced and unbounded. The record wants "which
+    /// check failed", and a `reason` column that can hold arbitrary provider
+    /// text is a column nobody can group by.
+    pub fn code(&self) -> &'static str {
+        match self {
+            OauthError::NotConfigured => "not_configured",
+            OauthError::InvalidUrl(_) => "invalid_url",
+            OauthError::Discovery(_) => "discovery_failed",
+            OauthError::UnknownTxn => "unknown_txn",
+            OauthError::TxnExpired => "txn_expired",
+            OauthError::StateMismatch => "state_mismatch",
+            OauthError::ProviderError(_) => "provider_error",
+            OauthError::Exchange(_) => "exchange_failed",
+            OauthError::MissingIdToken => "missing_id_token",
+            OauthError::InvalidIdToken(_) => "invalid_id_token",
+        }
+    }
+}
+
 /// What a successful [`OidcClient::complete_login`] hands back: enough to
 /// mint a session (`sub`) plus the upstream grant material for whichever
 /// milestone wires durable custody storage (`store::` is out of scope for

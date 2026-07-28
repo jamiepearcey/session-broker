@@ -192,6 +192,55 @@ jobs existing:
 All five jobs green on
 [PR #1](https://github.com/jamiepearcey/session-broker/pull/1).
 
+## Added since (2026-07-28) — gaps closed, and two bugs the tests found
+
+The four gaps listed after the observability work are closed:
+
+- **`custody.degraded`/`custody.dead`/`custody.revoked_upstream`** are emitted by
+  the keepalive worker, once per **transition** rather than per retry. The guard
+  has a mutation-tested case behind it — 4 rows without it, 1 with.
+- **`login.failed`** carries a stable `OauthError::code()` rather than the
+  error's `Display`, which embeds provider-supplied strings: attacker-influenced,
+  unbounded, and impossible to group by.
+- **`broker_keepalive_refresh_total` / `_upstream_duration_seconds`** are
+  observed, timed around the upstream call only.
+- **INV-12 has a log-stream test.** The audit-row half was already tested; this
+  installs a scoped subscriber over an in-memory writer and greps the bytes. It
+  has a positive control, which is what made it useful — see below.
+
+**Two real bugs, both found by the new tests rather than by reading:**
+
+1. **`emit_to_log` dropped `client_ip_prefix` and `detail`.** The log-stream
+   archive was strictly poorer than the store's 90-day window, which falsifies
+   ADR-0014's claim that the stream *is* the archive. Caught by the redaction
+   test's positive control — the assertion that permitted identifiers ARE
+   present, without which the test would pass against a subscriber emitting
+   nothing.
+2. **Custody failures were never persisted.** Nothing sent
+   `CustodyWrite::Failure`, so `repo::update_custody_failure` was unreachable and
+   the durable row never left `status='ok', fail_count=0` however many refreshes
+   failed. `live_custody_schedules`' `status != 'dead'` filter could therefore
+   never match: a dead grant came back alive on every boot with its backoff
+   reset. `/admin/custody`, the Custody console view and the brand-new
+   `broker_custody{status}` gauge all read those rows, so all three reported
+   healthy grants that were not — the exact symptom the Custody view exists to
+   surface. The worker now persists health and backoff on every failure,
+   fire-and-forget: no token rotates on a failure, so §6's write-through hazard
+   does not apply, and an ack per failure would serialise the whole fleet behind
+   one fsync during precisely the outage that produces them.
+
+### Verified by running it
+
+| Claim | Result |
+|---|---|
+| `login.failed` with distinct reasons | ✅ `no_txn_cookie`, `state_mismatch` |
+| IdP killed under a live session | ✅ one `custody.degraded`, not one per retry (5 transients) |
+| Fresh IdP instance rejects the old grant | ✅ `custody.dead`, then `custody.revoked_upstream` `{policy: kill, sessions_killed: 1}` |
+| Keepalive metrics populate | ✅ `success` / `transient` / `permanent` + latency histogram |
+| Durable custody row tracks reality | ✅ `status=degraded fail_count=2`, and `/admin/custody` agrees |
+
+152 crate tests green, clippy clean under `-D warnings`.
+
 ## Known gaps that remain
 
 - **The `/proxy/*` browser lane is not built.** ADR-0007's other half. Nothing
@@ -202,12 +251,9 @@ All five jobs green on
   but the file grows without bound.
 - **Login transactions are still in-memory.** A restart mid-login costs one
   retry.
-- **Three catalogued audit actions are declared but not emitted**:
-  `custody.degraded`/`custody.dead`/`custody.revoked_upstream` (the keepalive
-  worker holds no `AuditSink`) and `login.failed` (the callback's failure paths
-  funnel through one `error_redirect` that does not carry the reason).
-  Keepalive's two metric families are likewise declared and rendered but never
-  observed. See `docs/tasks/current.md`.
+- ~~Three catalogued audit actions declared but not emitted~~ — **closed
+  2026-07-28.** All of `custody.*` and `login.failed` are emitted, and the
+  keepalive metric families are observed. See below.
 
 ## Not built, deliberately
 

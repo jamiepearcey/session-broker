@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::clock::{Clock, Timestamp};
 use crate::session::{CustodyId, CustodyStatus, RevocationPolicy, SessionMap};
+use crate::store::writer::WriterHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KeepalivePolicy {
@@ -338,6 +339,20 @@ pub struct KeepaliveWorker<U: Upstream> {
     clock: Arc<dyn Clock>,
     jitter: Arc<dyn Jitter>,
     upstream: Arc<U>,
+    /// Counters for the background plane. Always present — a no-op `Metrics`
+    /// costs an atomic add nobody reads, which is cheaper than an `Option`
+    /// branch at every call site plus the chance of forgetting one.
+    metrics: Arc<crate::telemetry::Metrics>,
+    /// `None` in the scheduler tests, which have no store behind them.
+    audit: Option<crate::audit::AuditSink>,
+    /// Where a FAILED refresh's health and backoff are persisted.
+    ///
+    /// Without this the durable `custody` row never leaves `status='ok',
+    /// fail_count=0`, so a dead grant comes back alive after a restart with its
+    /// backoff reset — and `live_custody_schedules`' `status != 'dead'` filter
+    /// can never match anything. The success path writes through from
+    /// `custody::OidcUpstream`; this is the other half.
+    writer: Option<WriterHandle>,
 }
 
 impl<U: Upstream> KeepaliveWorker<U> {
@@ -354,7 +369,32 @@ impl<U: Upstream> KeepaliveWorker<U> {
             clock,
             jitter,
             upstream,
+            metrics: crate::telemetry::Metrics::new(),
+            audit: None,
+            writer: None,
         }
+    }
+
+    /// Attach the store, so failed refreshes persist their health and backoff.
+    pub fn with_durability(mut self, writer: WriterHandle) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// Attach the observability planes.
+    ///
+    /// A builder rather than two more parameters on `new`: the worker is
+    /// constructed in a dozen scheduler tests that care about backoff and
+    /// jitter and nothing else, and widening the constructor would edit all of
+    /// them to say `None` twice.
+    pub fn with_observability(
+        mut self,
+        metrics: Arc<crate::telemetry::Metrics>,
+        audit: Option<crate::audit::AuditSink>,
+    ) -> Self {
+        self.metrics = metrics;
+        self.audit = audit;
+        self
     }
 
     pub fn scheduler_mut(&mut self) -> &mut Scheduler {
@@ -379,12 +419,17 @@ impl<U: Upstream> KeepaliveWorker<U> {
                 let upstream = self.upstream.clone();
                 let custody = custody.clone();
                 inflight.spawn(async move {
+                    // Timed around the upstream call only. This is the one
+                    // histogram in the service that measures the IdP rather
+                    // than the broker, which is exactly what makes it useful
+                    // when "the broker is slow" turns out not to be true.
+                    let started = std::time::Instant::now();
                     let outcome = upstream.refresh(&custody).await;
-                    (custody, outcome)
+                    (custody, outcome, started.elapsed())
                 });
             }
             while let Some(joined) = inflight.join_next().await {
-                let Ok((custody, outcome)) = joined else {
+                let Ok((custody, outcome, elapsed)) = joined else {
                     // A panicking refresh must not take the worker down; the
                     // custody simply stays scheduled and is retried.
                     tracing::error!("keepalive refresh task panicked");
@@ -392,12 +437,36 @@ impl<U: Upstream> KeepaliveWorker<U> {
                 };
                 let now = self.clock.now();
                 let permanent = outcome == RefreshOutcome::Permanent;
+                let outcome_was_success = matches!(outcome, RefreshOutcome::Success { .. });
+                let label = match outcome {
+                    RefreshOutcome::Success { .. } => "success",
+                    RefreshOutcome::Transient { .. } => "transient",
+                    RefreshOutcome::Permanent => "permanent",
+                };
+                self.metrics.record_keepalive(label, Some(elapsed));
+
+                // Read before recording: `record` moves the state, and the
+                // audit row is about the TRANSITION, not the current value.
+                // Without this, a grant dead for a week would emit a
+                // `custody.dead` row on every retry — a record turning into a
+                // log.
+                let before = self.scheduler.get(&custody).map(|s| s.status);
                 let status = self
                     .scheduler
                     .record(&custody, outcome, now, self.jitter.as_ref());
 
                 if let Some(status) = status {
                     self.sessions.set_custody_status(&custody, status);
+                    if before != Some(status) {
+                        self.record_transition(&custody, status, now);
+                    }
+                    // Persist health and backoff on every failure, not only on
+                    // transitions: `fail_count` and `next_refresh` move each
+                    // time, and a restart that resurrected the old backoff
+                    // would stampede a recovering IdP.
+                    if !outcome_was_success {
+                        self.persist_failure(&custody, status, now);
+                    }
                 }
                 if permanent
                     && self.scheduler.policy().on_upstream_revoked == RevocationPolicy::Kill
@@ -409,11 +478,74 @@ impl<U: Upstream> KeepaliveWorker<U> {
                         killed,
                         "upstream grant revoked; sessions tombstoned"
                     );
+                    if let Some(sink) = &self.audit {
+                        sink.record(
+                            crate::audit::Event::new(
+                                crate::audit::action::CUSTODY_REVOKED_UPSTREAM,
+                                crate::audit::Outcome::Success,
+                                crate::audit::ActorKind::System,
+                                now,
+                            )
+                            .custody_id(custody.0.clone())
+                            // The policy is in the row because the same event
+                            // means different things under `kill` and
+                            // `degrade` (ADR-0011), and an operator reading
+                            // this months later will not remember which was
+                            // configured that day.
+                            .detail(serde_json::json!({
+                                "policy": "kill",
+                                "sessions_killed": killed,
+                            })),
+                        );
+                    }
                 }
                 handled += 1;
             }
         }
         handled
+    }
+
+    /// Write a failed refresh's health and backoff through to the store.
+    ///
+    /// The values come from the scheduler rather than being recomputed here:
+    /// it owns the backoff policy, and two places deriving `next_refresh`
+    /// independently is how memory and disk start disagreeing about when a
+    /// grant is due.
+    fn persist_failure(&self, custody: &CustodyId, status: CustodyStatus, now: Timestamp) {
+        let Some(writer) = &self.writer else { return };
+        let Some(state) = self.scheduler.get(custody) else {
+            return;
+        };
+        writer.enqueue_custody_failure(
+            custody.clone(),
+            status,
+            state.fail_count as i64,
+            state.next_refresh,
+            now,
+        );
+    }
+
+    /// One audit row per health transition (ADR-0015, Tier B).
+    ///
+    /// `Ok` transitions are not recorded: recovery is the expected outcome of
+    /// the retry the failure row already documents, and a row for it would
+    /// double the volume to say "as designed". The failure is the fact.
+    fn record_transition(&self, custody: &CustodyId, status: CustodyStatus, now: Timestamp) {
+        let Some(sink) = &self.audit else { return };
+        let action = match status {
+            CustodyStatus::Degraded => crate::audit::action::CUSTODY_DEGRADED,
+            CustodyStatus::Dead => crate::audit::action::CUSTODY_DEAD,
+            CustodyStatus::Ok => return,
+        };
+        sink.record(
+            crate::audit::Event::new(
+                action,
+                crate::audit::Outcome::Failure,
+                crate::audit::ActorKind::System,
+                now,
+            )
+            .custody_id(custody.0.clone()),
+        );
     }
 }
 
@@ -650,6 +782,258 @@ mod tests {
         async fn refresh(&self, _custody: &CustodyId) -> RefreshOutcome {
             self.0.clone()
         }
+    }
+
+    /// A grant that has been failing for hours must leave ONE `custody.degraded`
+    /// row, not one per retry.
+    ///
+    /// The audit table records what CHANGED. A row per attempt would turn it
+    /// into a log, bury the transition that mattered under repetitions of
+    /// itself, and spend the Tier-B queue budget that exists for events nobody
+    /// can reconstruct afterwards.
+    ///
+    /// `Transient` rather than `Permanent` on purpose: the scheduler stops
+    /// scheduling a DEAD custody, so a dead grant cannot be retried and the
+    /// regression this guards against is unreachable there. A degraded one
+    /// keeps being retried, which is exactly where a missing transition check
+    /// would show up.
+    #[tokio::test]
+    async fn a_custody_health_transition_is_recorded_once_not_on_every_retry() {
+        use crate::store::repo::{self, AuditQuery};
+        use crate::store::writer::{AdminWrite, Writer};
+
+        // File-backed: two `:memory:` connections are two separate databases,
+        // so rows the writer commits would be invisible to a reader.
+        let path = std::env::temp_dir().join(format!(
+            "session-broker-keepalive-audit-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let keyfile = path.with_extension("key");
+        let writer = Writer::spawn(crate::store::open(&path, &keyfile).unwrap());
+        let reader = crate::store::open(&path, &keyfile).unwrap();
+
+        let metrics = crate::telemetry::Metrics::new();
+        let audit = crate::audit::AuditSink::new(
+            writer.handle(),
+            metrics.clone(),
+            crate::audit::AuditConfig::default(),
+        );
+
+        let (worker, _sessions, clock) = worker(
+            RefreshOutcome::Transient {
+                retry_after_secs: Some(1),
+            },
+            RevocationPolicy::Degrade,
+        );
+        let mut worker = worker.with_observability(metrics.clone(), Some(audit));
+
+        let custody = CustodyId("c1".into());
+        // Lifetime 100s; every tick below is past that, so each failure lands
+        // with the access token already expired — which is what makes the
+        // status Degraded rather than a still-fine Ok.
+        worker
+            .scheduler_mut()
+            .insert(custody.clone(), T0, 100, &FixedJitter(0.5));
+
+        let mut attempts = 0;
+        for _ in 0..4 {
+            clock.advance(500);
+            attempts += worker.tick().await;
+        }
+        assert!(
+            attempts >= 3,
+            "the custody must actually have been retried several times, or this \
+             test proves nothing; got {attempts}"
+        );
+
+        // Force a flush: batches apply in order, so a write-through ack means
+        // everything enqueued before it has committed.
+        let _ = writer.handle().write_admin(AdminWrite::TouchApiKey {
+            key_id: "nobody".to_owned(),
+            now: T0,
+        });
+
+        let rows = repo::list_audit(
+            &reader,
+            &AuditQuery {
+                limit: 100,
+                ..AuditQuery::default()
+            },
+        )
+        .unwrap();
+        let degraded = rows
+            .iter()
+            .filter(|r| r.row.action == crate::audit::action::CUSTODY_DEGRADED)
+            .count();
+        assert_eq!(
+            degraded, 1,
+            "{attempts} failing attempts must leave one transition row: {rows:?}"
+        );
+
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        let _ = std::fs::remove_file(&keyfile);
+    }
+
+    /// Insert a custody row so the UPDATEs under test have something to hit —
+    /// an UPDATE against a missing row is a silent no-op, and asserting on one
+    /// would prove nothing.
+    fn seed_custody(writer: &crate::store::writer::WriterHandle, custody: &CustodyId) {
+        writer
+            .write_custody(crate::store::writer::CustodyWrite::Insert(
+                crate::store::repo::CustodyRow {
+                    custody_id: custody.clone(),
+                    sub: "user-1".to_owned(),
+                    refresh_tok: b"refresh".to_vec(),
+                    access_tok: b"access".to_vec(),
+                    access_exp: T0.plus_secs(100),
+                    scope: None,
+                    status: CustodyStatus::Ok,
+                    next_refresh: T0.plus_secs(60),
+                    fail_count: 0,
+                    updated_at: T0,
+                },
+            ))
+            .unwrap();
+    }
+
+    /// A temp store plus a second connection to read it back.
+    fn durable_store(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        crate::store::writer::Writer,
+        rusqlite::Connection,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "session-broker-custody-{tag}-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let keyfile = path.with_extension("key");
+        let writer =
+            crate::store::writer::Writer::spawn(crate::store::open(&path, &keyfile).unwrap());
+        let reader = crate::store::open(&path, &keyfile).unwrap();
+        (path, writer, reader)
+    }
+
+    fn cleanup_store(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        let _ = std::fs::remove_file(path.with_extension("key"));
+    }
+
+    /// Batches apply in order, so a write-through ack means every
+    /// fire-and-forget command enqueued before it has committed.
+    fn flush(writer: &crate::store::writer::WriterHandle) {
+        let _ = writer.write_admin(crate::store::writer::AdminWrite::TouchApiKey {
+            key_id: "nobody".to_owned(),
+            now: T0,
+        });
+    }
+
+    /// A transient failure must persist its backoff.
+    ///
+    /// This was silently broken: nothing sent `CustodyWrite::Failure`, so the
+    /// durable row never left `status='ok', fail_count=0` however many times a
+    /// refresh failed — and a restart resurrected the old schedule, which is how
+    /// a recovering IdP gets stampeded by a fleet that forgot it was backing off.
+    #[tokio::test]
+    async fn a_failed_refresh_persists_its_health_and_backoff() {
+        use crate::store::repo;
+
+        let (path, writer, reader) = durable_store("backoff");
+        let custody = CustodyId("c1".into());
+        seed_custody(&writer.handle(), &custody);
+
+        let (worker, _sessions, clock) = worker(
+            RefreshOutcome::Transient {
+                retry_after_secs: Some(90),
+            },
+            RevocationPolicy::Degrade,
+        );
+        let mut worker = worker.with_durability(writer.handle());
+        worker
+            .scheduler_mut()
+            .insert(custody.clone(), T0, 100, &FixedJitter(0.5));
+
+        // Past the access token's expiry, so the failure is genuinely degrading.
+        clock.advance(200);
+        assert_eq!(worker.tick().await, 1);
+        flush(&writer.handle());
+
+        let row = repo::load_custody(&reader, &custody).unwrap().unwrap();
+        assert_eq!(row.status, CustodyStatus::Degraded);
+        assert!(
+            row.fail_count > 0,
+            "the retry counter must survive a restart, or the backoff resets"
+        );
+        assert!(
+            row.next_refresh.secs() > T0.plus_secs(60).secs(),
+            "and so must the backed-off schedule"
+        );
+
+        drop(reader);
+        drop(writer);
+        cleanup_store(&path);
+    }
+
+    /// A grant that dies must STAY dead across a restart.
+    ///
+    /// `live_custody_schedules` filters `status != 'dead'` — a filter that could
+    /// never match anything while no failure was ever written, so a dead grant
+    /// came back alive on every boot. `/admin/custody`, the Custody console view
+    /// and the `broker_custody{status}` gauge read the same rows, so all three
+    /// reported healthy grants that were not.
+    #[tokio::test]
+    async fn a_dead_grant_is_not_handed_back_to_the_restart_path() {
+        use crate::store::repo;
+
+        let (path, writer, reader) = durable_store("dead");
+        let custody = CustodyId("c1".into());
+        seed_custody(&writer.handle(), &custody);
+
+        let (worker, _sessions, clock) =
+            worker(RefreshOutcome::Permanent, RevocationPolicy::Degrade);
+        let mut worker = worker.with_durability(writer.handle());
+        worker
+            .scheduler_mut()
+            .insert(custody.clone(), T0, 100, &FixedJitter(0.5));
+
+        clock.advance(200);
+        assert_eq!(worker.tick().await, 1);
+        flush(&writer.handle());
+
+        let row = repo::load_custody(&reader, &custody).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            CustodyStatus::Dead,
+            "the durable row must record the death"
+        );
+        // `fail_count` deliberately does NOT move here: a permanent failure
+        // stops scheduling outright, so a retry counter would describe retries
+        // that will never happen.
+
+        let live = repo::live_custody_schedules(&reader).unwrap();
+        assert!(
+            live.iter().all(|s| s.custody_id != custody),
+            "a dead grant must not be restored on the next boot"
+        );
+
+        drop(reader);
+        drop(writer);
+        cleanup_store(&path);
     }
 
     fn worker(
