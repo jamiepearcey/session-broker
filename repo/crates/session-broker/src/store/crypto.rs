@@ -167,12 +167,10 @@ pub(crate) fn open(sealed: &[u8]) -> Result<Vec<u8>, String> {
     let Ok(nonce) = XNonce::try_from(nonce) else {
         return Err("sealed value has a malformed nonce prefix".to_owned());
     };
-    cipher()
-        .decrypt(&nonce, ciphertext)
-        .map_err(|_| {
-            "custody value failed authenticated decryption (wrong key, or the row was altered)"
-                .to_owned()
-        })
+    cipher().decrypt(&nonce, ciphertext).map_err(|_| {
+        "custody value failed authenticated decryption (wrong key, or the row was altered)"
+            .to_owned()
+    })
 }
 
 #[cfg(test)]
