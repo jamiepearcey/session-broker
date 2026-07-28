@@ -200,7 +200,17 @@ impl BrokerConfig {
             format: parse_field(sources, "log_format", "text")?,
             // Kept identical to what `main.rs` used to hard-code, so upgrading
             // changes what is *configurable*, not what is emitted by default.
-            default_filter: sources.get_or("log_level", "session_broker=info,tower_http=warn"),
+            // `broker=info` is load-bearing, not decoration. Events in this
+            // service carry explicit targets — `broker::audit`, `broker::http`,
+            // `broker::authz`, `broker::telemetry` — and an `EnvFilter`
+            // directive matches the TARGET, not the crate. Without a `broker`
+            // directive, `session_broker=info` matches the module-path events
+            // and silently drops every one of the named ones, including the
+            // audit stream that ADR-0014 calls the long-term archive.
+            default_filter: sources.get_or(
+                "log_level",
+                "session_broker=info,broker=info,tower_http=warn",
+            ),
             file: sources.get("log_file").map(PathBuf::from),
             file_rotation: parse_field(sources, "log_file_rotation", "daily")?,
             queue_capacity: parse_field(sources, "log_queue_capacity", "16384")?,

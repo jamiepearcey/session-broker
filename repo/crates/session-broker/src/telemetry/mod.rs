@@ -138,7 +138,7 @@ impl Default for LogConfig {
     fn default() -> LogConfig {
         LogConfig {
             format: LogFormat::Text,
-            default_filter: "session_broker=info,tower_http=warn".to_owned(),
+            default_filter: "session_broker=info,broker=info,tower_http=warn".to_owned(),
             file: None,
             file_rotation: FileRotation::Daily,
             queue_capacity: 16_384,

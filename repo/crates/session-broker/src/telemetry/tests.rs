@@ -222,3 +222,75 @@ fn no_secret_material_reaches_the_log_stream() {
     assert!(text.contains("bk_visible"));
     assert!(text.contains("203.0.113.0/24"));
 }
+
+/// The default filter must actually pass the broker's own event targets.
+///
+/// This existed as a bug and nothing caught it. Events here carry explicit
+/// targets — `broker::audit`, `broker::http`, `broker::authz`,
+/// `broker::telemetry` — and an `EnvFilter` directive matches the TARGET, not
+/// the crate that emitted it. So `session_broker=info` matched every
+/// module-path event and silently dropped every named one, including the audit
+/// stream ADR-0014 calls the long-term archive: a deployment shipping logs to a
+/// SIEM for seven-year retention would have archived nothing at all.
+///
+/// The redaction test next door did not catch it because it installs a
+/// subscriber with `max_level(TRACE)` and no `EnvFilter`, so it exercises the
+/// formatter rather than the filter.
+#[test]
+fn the_default_filter_passes_every_broker_event_target() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let filter = LogConfig::default().default_filter;
+
+    for target in [
+        "broker::audit",
+        "broker::http",
+        "broker::authz",
+        "broker::telemetry",
+    ] {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let mut g = self.0.lock().unwrap();
+                g.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::try_new(&filter).expect("the shipped default must parse"))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(Sink(captured.clone())),
+            );
+
+        tracing::subscriber::with_default(subscriber, || match target {
+            "broker::audit" => tracing::info!(target: "broker::audit", action = "probe", "audit"),
+            "broker::http" => {
+                tracing::warn!(target: "broker::http", route = "/probe", "request failed")
+            }
+            "broker::authz" => tracing::warn!(target: "broker::authz", reason = "probe", "denied"),
+            _ => tracing::warn!(target: "broker::telemetry", "probe"),
+        });
+
+        let out = String::from_utf8_lossy(&captured.lock().unwrap().clone()).to_string();
+        assert!(
+            out.contains(target),
+            "the default filter {filter:?} drops target {target:?} — anything logged \
+             under it reaches no sink at all"
+        );
+    }
+}
