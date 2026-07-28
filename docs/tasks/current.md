@@ -130,6 +130,13 @@ Milestones are defined in
          hazard does not apply, and an ack per failure would serialise the whole
          fleet behind one fsync during an outage).
 
+- [x] **Dependencies current (2026-07-29).** All 11 Dependabot PRs applied and
+      merged; the majors needed real work (see `.context/current-state.md`).
+      Running the result found that `EnvFilter` matches the event TARGET, not
+      the crate — so the default filter had been silently dropping every
+      `broker::*` event, audit stream included. Fixed with a test that fails
+      against the old default.
+
 ## Deferred
 
 - Subdomain/CORS topology (INV-10 keeps v1 path-mounted)

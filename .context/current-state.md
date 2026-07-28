@@ -241,6 +241,57 @@ The four gaps listed after the observability work are closed:
 
 152 crate tests green, clippy clean under `-D warnings`.
 
+## Added since (2026-07-28/29) — dependencies taken, and a filter bug found by running it
+
+All 11 pending Dependabot updates applied on one branch (they shared lockfiles,
+so individually they would have been ten rebases). Notes worth keeping:
+
+- **`rand` 0.10 renamed `OsRng` → `SysRng` and made it fallible (`TryRng`).**
+  Rather than fix five call sites separately, all secret material now goes
+  through one `token::fill_random` — the INV-5 boundary in one reviewable place.
+  It panics on entropy failure deliberately: a token or key from a degraded
+  source fails open, silently, and nothing downstream can tell.
+- **`jsonwebtoken` 11 requires the crypto provider chosen explicitly** and
+  panics at *first use*, not at build time. Took `rust_crypto`, matching the
+  workspace's existing `rustls-tls` posture.
+- **`mock-idp` is pinned to `rand` 0.8** because `rsa` still wants rand_core
+  0.6. Pinning the fixture keeps the broker current, and the fixture ships in no
+  release artifact.
+- **Dependabot rewrote the pinned MSRV.** It read
+  `dtolnay/rust-toolchain@1.88.0` as an action version and bumped it to
+  `@1.100.0`, silently converting the `msrv` job into a duplicate of the main
+  one. The toolchain is now a `with:` value and `dependabot.yml` ignores that
+  action.
+
+**The bug running it found — `EnvFilter` matches the TARGET, not the crate.**
+This service's events carry explicit targets (`broker::audit`, `broker::http`,
+`broker::authz`, `broker::telemetry`), so the default
+`session_broker=info,tower_http=warn` matched every module-path event and
+**silently dropped every named one — including the audit stream**. ADR-0014
+calls that stream the long-term archive, so a deployment shipping to a SIEM for
+long retention was archiving nothing. Fixed in the config default,
+`LogConfig::default` and the console presets, with a test that fails against the
+old value.
+
+Why nothing caught it: the redaction test installs a subscriber with
+`max_level(TRACE)` and no `EnvFilter`, so it exercises the formatter, not the
+filter. **Testing what a sink writes says nothing about whether anything reaches
+the sink.**
+
+### Verified by running it (full stack, updated deps)
+
+| Claim | Result |
+|---|---|
+| Login → session → `/internal/token` | ✅ |
+| INV-5: upstream token findable in `broker.db` | ✅ **No** — sealed under chacha 0.11 |
+| Refresh coalescing | ✅ 3 coalesced, ~0.6 ms handler time |
+| Keepalive rotates the upstream token, no re-login | ✅ token changed under a live session |
+| Console (vite 8) Audit trail + Observability | ✅ browser-driven |
+| Verbosity raise → audited → self-restores | ✅ both changes recorded, gauge back to 0 |
+| `broker::audit` reaching the log stream | ✅ after the fix; 1 line across a whole lifecycle before |
+
+153 crate tests, clippy clean, CI green on `main`.
+
 ## Known gaps that remain
 
 - **The `/proxy/*` browser lane is not built.** ADR-0007's other half. Nothing
