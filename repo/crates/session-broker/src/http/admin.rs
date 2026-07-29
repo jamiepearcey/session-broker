@@ -385,7 +385,10 @@ async fn revoke_session(
     if !killed {
         state
             .writer
-            .enqueue(crate::store::writer::Command::TombstoneSession(sid.clone()));
+            .enqueue(crate::store::writer::Command::TombstoneSession(
+                sid.clone(),
+                now,
+            ));
     }
 
     // Tier A by classification, but it cannot ride the tombstone the way a key

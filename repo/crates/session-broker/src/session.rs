@@ -829,7 +829,7 @@ impl SessionMap {
             // on a ≤50 ms interval and a crash inside that window is the same
             // exposure as the request never having arrived — but it is the
             // first candidate if that judgement is ever revisited.
-            self.persist(Command::TombstoneSession(sid.clone()));
+            self.persist(Command::TombstoneSession(sid.clone(), now));
             // Announced from inside the map, not from the three call sites that
             // kill sessions, so there is exactly one path that kills and one
             // that announces. A future fourth caller cannot forget.

@@ -76,7 +76,7 @@ Milestones are defined in
 - [ ] **M5b ⚙** the `/proxy/*` browser lane. Deliberately deferred: the
       platform routes data traffic directly to services, which authenticate
       via `/internal/token`, so nothing needs the proxy today.
-- [ ] **M6 ⚙** reaper task, rate limiting. *(Anomaly events are now recorded:
+- [ ] **M6 ⚙** rate limiting. *(The reaper is DONE — see below. Anomaly events are recorded:
       superseded- and retired-generation use emit `session.anomaly` rows and
       `broker_session_anomalies_total`. The remaining INV-6a signal — two
       generations used concurrently from different IP prefixes — needs the
@@ -84,6 +84,26 @@ Milestones are defined in
       for, and is not wired.)*
 - [ ] **M9 ★** race/multi-tab harness (concurrency + Playwright)
 - [ ] Browser verification of `repo/ui/` against the running broker
+
+## Closed since (2026-07-29)
+
+- [x] **M6 reaper.** Nothing removed dead rows: `Command::DeleteExpiredTxns`
+      was handled by the writer but never sent, `SessionMap::sweep` was called
+      only from tests, and there was **no SQL at all** to delete tombstoned
+      sessions or their generations. The same shape as the custody-failure bug —
+      machinery that exists, wired to nothing.
+
+      Schema v4 adds `session.tombstoned_at`, because a retention policy needs
+      the timestamp of the event it retains from. `repo::reap` is now the only
+      place that deletes session/generation/txn/custody rows, on three
+      independently-safe predicates, and a task sweeps both memory and disk every
+      10 minutes. Orphaned custody rows go too, which shrinks the credential
+      material at rest.
+
+      Verified live: 3 sessions, 2 logged out, restart → reaped 2 sessions, 2
+      generations, 2 custodies; the live session survived and was still usable;
+      and **5 audit rows still describe all 3 sessions**, which is the design
+      working — the store keeps a working set, the audit record keeps the history.
 
 ## Known gaps, stated plainly
 
@@ -96,12 +116,12 @@ Milestones are defined in
   durable `txn` table exists in the store for when that matters.
 - The keepalive worker's async runner is exercised via `tick()`; the sleep loop
   around it is not yet driven by a test.
-- The React SDK and demo app (`repo/ui/`) are built and unit-tested in isolation
-  only. There is no bootable `session-broker` binary yet (`main.rs` wiring is
-  still on the "Next" list) and OAuth login/callback (M2) isn't built, so the
-  demo's live panel, leader promotion across real tabs, forced-race button, and
-  failure-path controls have not been exercised against a running broker —
-  only against mocked `fetch`/`navigator.locks` in the SDK's own tests.
+- The **demo app** (`repo/ui/apps/demo`) has still not been driven against a
+  running broker: its live panel, cross-tab leader promotion, forced-race button
+  and failure-path controls are exercised only against mocked
+  `fetch`/`navigator.locks` in the SDK's own tests. (The **console** has been
+  browser-verified repeatedly; this bullet used to claim there was no bootable
+  binary, which stopped being true on 2026-07-26.)
 
 ## Closed since (2026-07-28)
 

@@ -292,6 +292,45 @@ the sink.**
 
 153 crate tests, clippy clean, CI green on `main`.
 
+## Added since (2026-07-29) — the reaper (M6)
+
+Nothing removed dead rows. `Command::DeleteExpiredTxns` was handled by the
+writer but never sent, `SessionMap::sweep` was called only from tests, and there
+was **no SQL at all** to delete tombstoned sessions or their generations — the
+same shape as the custody-failure bug: machinery that exists, wired to nothing.
+`live_custody_schedules`' filter and the txn TTL were both inert for the same
+reason.
+
+- **Schema v4** adds `session.tombstoned_at`. A retention policy needs the
+  timestamp of the event it retains from, and `tombstone_session` recorded only
+  `status`. `COALESCE` keeps the FIRST death, so a client retrying an idempotent
+  logout cannot keep a dead row alive by pushing its timestamp forward.
+- **`repo::reap`** is the only place that deletes session/generation/txn/custody
+  rows, on three independently-safe predicates (tombstoned past the window;
+  `absolute_exp` past the window; txn past INV-3's 10 minutes). A NULL
+  `tombstoned_at` from before v4 falls through to `absolute_exp` rather than
+  being treated as old — guessing old on a delete path is the wrong direction to
+  be wrong in.
+- **Orphaned custody rows go too**, which shrinks the credential material at
+  rest: a custody no session references holds an encrypted refresh token nobody
+  can ever use.
+- A task sweeps **both memory and disk** every 10 minutes. Neither substitutes
+  for the other — memory is rebuilt from disk on restart, and disk is never
+  re-read while running.
+
+The "a live session survives every sweep" test is mutation-checked: inverting
+the `absolute_exp` guard fails it.
+
+### Verified by running it
+
+3 logins, 2 logouts, restart → reaper removed 2 sessions, 2 generations and 2
+orphaned custodies; the live session survived and still answered `/session`;
+`txn` emptied. And **5 audit rows still describe all 3 sessions with only 1
+session row left** — the store keeps a working set, the audit record keeps the
+history.
+
+160 crate tests, clippy clean.
+
 ## Known gaps that remain
 
 - **The `/proxy/*` browser lane is not built.** ADR-0007's other half. Nothing

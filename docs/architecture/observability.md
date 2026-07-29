@@ -112,6 +112,7 @@ Every key is `BROKER_<KEY>` in the environment or a bare key in
 | `audit_queue_capacity` | `8192` | Tier-B in-flight bound. At the bound, events drop and a gap is recorded. |
 | `audit_coalesce_secs` | `300` | Window in which repeated `token.exchanged` for the same `(key_id, sid)` collapse to one row. Refusals never coalesce. |
 | `audit_record_rotations` | `false` | Record every generation rotation. High volume, low value — anomalous rotations are recorded regardless. |
+| `reap_after_secs` | `86400` | How long a provably-dead session row is kept before the reaper removes it. `0` disables reaping, and the store then grows without bound. The audit record outlives these rows by design, so history is not what this prunes. |
 | `audit_subject_mode` | `plain` | `hashed` stores `sub`/`actor_id` as a keyed truncated SHA-256: still correlatable, no longer naming people. |
 
 ---
