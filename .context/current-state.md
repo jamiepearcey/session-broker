@@ -71,7 +71,9 @@ the access token changed underneath a browser session that never re-authenticate
 
 ## In flight
 
-- Browser verification of `repo/ui/` against the now-running broker (M9).
+- **M9 as an automated test.** The race and multi-tab behaviours are now
+  browser-verified by hand (2026-07-29, below); what is missing is a Playwright
+  spec in CI so a regression is caught rather than noticed.
 
 ## Decisions worth knowing before you read code
 
@@ -330,6 +332,30 @@ session row left** — the store keeps a working set, the audit record keeps the
 history.
 
 160 crate tests, clippy clean.
+
+## Added since (2026-07-29) — the demo, verified in a browser at last
+
+Every claim in `repo/ui/apps/demo` had only ever run against mocked
+`fetch`/`navigator.locks`. Driven against a live broker + mock-idp:
+
+| Claim | Result |
+|---|---|
+| Login through the SPA, all three clocks | ✅ 10 min gen / 7 d idle / 30 d absolute |
+| **Forced race — the headline property** | ✅ 20 concurrent → **20 succeeded, 0 failed, 1 generation minted**, 11.2 ms |
+| Web Lock leader across two tabs | ✅ exactly one leader |
+| Promotion when the leader closes | ✅ survivor promoted and opened the SSE stream (ADR-0008) |
+| `session.killed` over SSE | ✅ admin revoke → `admin_revoked`, tab flipped to Expired instantly (ADR-0013) |
+| Stale cookie from a previous broker instance | ✅ 401 → cleared → anonymous, no wedged state |
+
+So ADR-0002 (non-invalidating rotation removes the refresh race), ADR-0008 (one
+Web Lock, no coordination traffic) and ADR-0013 (SSE as a hint) are now each
+demonstrated end to end rather than argued.
+
+One fix fell out: **both Vite dev servers bind `127.0.0.1` explicitly.** Vite
+defaults to `localhost`, which is `::1` on macOS, while the broker binds IPv4 —
+so a login built from `base_url` bounced off ERR_CONNECTION_REFUSED while the
+same page loaded fine over `localhost`. The proxy *targets* in those configs
+already carried a comment about exactly this; the server's own bind did not.
 
 ## Known gaps that remain
 
