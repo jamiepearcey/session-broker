@@ -116,7 +116,7 @@ pub enum Command {
         current_gen: u32,
         idle_exp: Timestamp,
     },
-    TombstoneSession(Sid),
+    TombstoneSession(Sid, Timestamp),
     InsertGeneration {
         sid: Sid,
         gen_no: u32,
@@ -155,8 +155,14 @@ pub enum Command {
         row: Box<AuditRow>,
         depth: Arc<AtomicI64>,
     },
-    /// Retention sweep.
+    /// Retention sweep for the audit record.
     PruneAudit(Timestamp),
+    /// The reaper (M6): drop provably-dead session, generation, txn and
+    /// orphaned custody rows. Write-behind — nothing waits on a deletion.
+    Reap {
+        dead_before: Timestamp,
+        txn_before: Timestamp,
+    },
     /// Internal: stop after committing whatever else is in this batch.
     Shutdown,
 }
@@ -402,8 +408,8 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                 } => {
                     repo::update_session_progress(&tx, &sid, current_gen, idle_exp)?;
                 }
-                Command::TombstoneSession(sid) => {
-                    repo::tombstone_session(&tx, &sid)?;
+                Command::TombstoneSession(sid, now) => {
+                    repo::tombstone_session(&tx, &sid, now)?;
                 }
                 Command::InsertGeneration {
                     sid,
@@ -467,6 +473,22 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                 }
                 Command::Audit { row, .. } => {
                     repo::insert_audit(&tx, &row)?;
+                }
+                Command::Reap {
+                    dead_before,
+                    txn_before,
+                } => {
+                    let reaped = repo::reap(&tx, dead_before, txn_before)?;
+                    if !reaped.is_empty() {
+                        tracing::info!(
+                            target: "broker::reaper",
+                            sessions = reaped.sessions,
+                            generations = reaped.generations,
+                            txns = reaped.txns,
+                            custodies = reaped.custodies,
+                            "reaped dead rows"
+                        );
+                    }
                 }
                 Command::PruneAudit(before) => {
                     let removed = repo::prune_audit(&tx, before)?;
@@ -722,5 +744,202 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::*;
+    use crate::session::SessionStatus;
+    use crate::store;
+
+    const T0: Timestamp = Timestamp(1_700_000_000);
+
+    /// One custody + one session + one generation, so a reap has something
+    /// FK-shaped to get wrong.
+    fn seed(conn: &Connection, sid: &str, custody: &str, absolute_exp: Timestamp) {
+        repo::insert_custody(
+            conn,
+            &CustodyRow {
+                custody_id: crate::session::CustodyId(custody.to_owned()),
+                sub: "user-1".to_owned(),
+                refresh_tok: b"r".to_vec(),
+                access_tok: b"a".to_vec(),
+                access_exp: T0.plus_secs(3600),
+                scope: None,
+                status: crate::session::CustodyStatus::Ok,
+                next_refresh: T0.plus_secs(1800),
+                fail_count: 0,
+                updated_at: T0,
+            },
+        )
+        .unwrap();
+        repo::insert_session(
+            conn,
+            &SessionRow {
+                sid: Sid(sid.to_owned()),
+                custody_id: crate::session::CustodyId(custody.to_owned()),
+                sub: "user-1".to_owned(),
+                current_gen: 1,
+                idle_exp: absolute_exp,
+                absolute_exp,
+                status: SessionStatus::Alive,
+                created_at: T0,
+                meta: None,
+            },
+        )
+        .unwrap();
+        repo::insert_generation(
+            conn,
+            &Sid(sid.to_owned()),
+            1,
+            &TokenHash::from_stored_bytes([sid.as_bytes()[0]; 32]),
+            T0,
+            absolute_exp,
+        )
+        .unwrap();
+    }
+
+    fn counts(conn: &Connection) -> (i64, i64, i64) {
+        let s = conn
+            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+            .unwrap();
+        let g = conn
+            .query_row("SELECT COUNT(*) FROM generation", [], |r| r.get(0))
+            .unwrap();
+        let c = conn
+            .query_row("SELECT COUNT(*) FROM custody", [], |r| r.get(0))
+            .unwrap();
+        (s, g, c)
+    }
+
+    /// The one that matters: a reap must never touch a live session.
+    #[test]
+    fn a_live_session_survives_every_sweep() {
+        let conn = store::open_in_memory().unwrap();
+        // Alive, ceiling far in the future.
+        seed(&conn, "live", "cust-live", T0.plus_secs(30 * 86_400));
+
+        // Sweep with a cutoff well past "now", which is the most aggressive
+        // thing the scheduler could ever ask for.
+        let out = repo::reap(&conn, T0.plus_secs(86_400), T0.plus_secs(86_400)).unwrap();
+
+        assert_eq!(out.sessions, 0, "a live session must never be reaped");
+        assert_eq!(out.generations, 0);
+        assert_eq!(
+            out.custodies, 0,
+            "and its custody must not be orphan-collected out from under it"
+        );
+        assert_eq!(counts(&conn), (1, 1, 1));
+    }
+
+    #[test]
+    fn a_tombstoned_session_is_reaped_only_once_its_window_has_passed() {
+        let conn = store::open_in_memory().unwrap();
+        seed(&conn, "dead", "cust-dead", T0.plus_secs(30 * 86_400));
+        repo::tombstone_session(&conn, &Sid("dead".to_owned()), T0).unwrap();
+
+        // Inside the retention window: kept, so an operator can still see it.
+        let out = repo::reap(&conn, Timestamp(T0.secs() - 1), T0).unwrap();
+        assert_eq!(out.sessions, 0, "still inside the window");
+        assert_eq!(counts(&conn), (1, 1, 1));
+
+        // Past it: session, its generation, and now-orphaned custody all go.
+        let out = repo::reap(&conn, T0.plus_secs(1), T0).unwrap();
+        assert_eq!(out.sessions, 1);
+        assert_eq!(out.generations, 1);
+        assert_eq!(
+            out.custodies, 1,
+            "an orphaned custody holds an encrypted refresh token nobody can \
+             use; removing it shrinks the credential material at rest"
+        );
+        assert_eq!(counts(&conn), (0, 0, 0));
+    }
+
+    /// A session past its hard ceiling can never authenticate again, tombstoned
+    /// or not — so it is reapable on `absolute_exp` alone.
+    #[test]
+    fn a_session_past_its_absolute_ceiling_is_reaped_even_while_alive() {
+        let conn = store::open_in_memory().unwrap();
+        seed(&conn, "expired", "cust-exp", T0);
+
+        let out = repo::reap(&conn, T0.plus_secs(1), T0).unwrap();
+        assert_eq!(out.sessions, 1);
+        assert_eq!(counts(&conn), (0, 0, 0));
+    }
+
+    /// Rows tombstoned before schema v4 have no `tombstoned_at`. Unknown must
+    /// mean "judge it on the ceiling", not "delete it" — guessing old on a
+    /// delete path is the wrong direction to be wrong in.
+    #[test]
+    fn a_pre_v4_tombstone_with_no_timestamp_is_not_deleted_on_a_guess() {
+        let conn = store::open_in_memory().unwrap();
+        seed(&conn, "legacy", "cust-legacy", T0.plus_secs(30 * 86_400));
+        conn.execute(
+            "UPDATE session SET status = 'tombstoned', tombstoned_at = NULL WHERE sid = 'legacy'",
+            [],
+        )
+        .unwrap();
+
+        let out = repo::reap(&conn, T0.plus_secs(86_400), T0).unwrap();
+        assert_eq!(
+            out.sessions, 0,
+            "a NULL tombstoned_at must fall through to absolute_exp, which has \
+             not passed"
+        );
+        assert_eq!(counts(&conn).0, 1);
+    }
+
+    #[test]
+    fn expired_login_transactions_are_reaped_and_fresh_ones_are_not() {
+        let conn = store::open_in_memory().unwrap();
+        for (id, at) in [(1u8, T0), (2u8, T0.plus_secs(1000))] {
+            repo::insert_txn(
+                &conn,
+                &TxnRow {
+                    txn_id: vec![id; 32],
+                    state: "s".to_owned(),
+                    nonce: "n".to_owned(),
+                    pkce_verifier: "v".to_owned(),
+                    return_to: "/".to_owned(),
+                    created_at: at,
+                },
+            )
+            .unwrap();
+        }
+
+        let out = repo::reap(&conn, T0, T0.plus_secs(600)).unwrap();
+        assert_eq!(out.txns, 1, "only the one past INV-3's 10-minute window");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM txn", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1);
+    }
+
+    /// Logout is idempotent, so a client retrying it must not be able to keep a
+    /// dead row alive by pushing its death forward.
+    #[test]
+    fn re_tombstoning_keeps_the_first_death_not_the_latest() {
+        let conn = store::open_in_memory().unwrap();
+        seed(&conn, "x", "cust-x", T0.plus_secs(30 * 86_400));
+        let sid = Sid("x".to_owned());
+        repo::tombstone_session(&conn, &sid, T0).unwrap();
+        repo::tombstone_session(&conn, &sid, T0.plus_secs(10_000)).unwrap();
+
+        let at: i64 = conn
+            .query_row(
+                "SELECT tombstoned_at FROM session WHERE sid = 'x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(at, T0.secs(), "the first death is the real one");
+    }
+
+    #[test]
+    fn reaping_an_empty_store_is_a_no_op_not_an_error() {
+        let conn = store::open_in_memory().unwrap();
+        let out = repo::reap(&conn, T0, T0).unwrap();
+        assert!(out.is_empty());
     }
 }

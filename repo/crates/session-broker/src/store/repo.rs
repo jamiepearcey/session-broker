@@ -452,10 +452,19 @@ pub fn update_session_progress(
 /// every code path that resolves a generation must check the parent
 /// session's status first, so an untouched `generation` row backed by a
 /// tombstoned session is already inert.
-pub fn tombstone_session(conn: &Connection, sid: &Sid) -> Result<(), RepoError> {
+/// Kill a session durably (INV-7).
+///
+/// `now` is stamped into `tombstoned_at` so the reaper has something to measure
+/// a retention window against. `COALESCE` keeps the FIRST death: logout is
+/// idempotent, and letting a retry push the timestamp forward would let a
+/// client keep a dead row alive indefinitely by retrying.
+pub fn tombstone_session(conn: &Connection, sid: &Sid, now: Timestamp) -> Result<(), RepoError> {
     conn.execute(
-        "UPDATE session SET status = 'tombstoned' WHERE sid = ?1",
-        params![sid.0],
+        "UPDATE session
+            SET status = 'tombstoned',
+                tombstoned_at = COALESCE(tombstoned_at, ?2)
+          WHERE sid = ?1",
+        params![sid.0, now.secs()],
     )?;
     Ok(())
 }
@@ -649,6 +658,89 @@ pub fn delete_expired_txns(conn: &Connection, before: Timestamp) -> Result<usize
         params![before.secs()],
     )?;
     Ok(n)
+}
+
+// ---------------------------------------------------------------------
+// reaper (M6)
+//
+// The ONLY place that removes session, generation, txn or custody rows.
+// Everything here is deliberately conservative: this is a delete path in a
+// service where deleting the wrong row logs a real person out.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReapOutcome {
+    pub generations: usize,
+    pub sessions: usize,
+    pub txns: usize,
+    pub custodies: usize,
+}
+
+impl ReapOutcome {
+    pub fn is_empty(&self) -> bool {
+        *self == ReapOutcome::default()
+    }
+}
+
+/// Remove what is provably dead.
+///
+/// Three independent predicates, each safe on its own:
+///
+/// * a session tombstoned longer ago than `dead_before` — it is already
+///   unreachable (`rehydrate` loads only `alive` rows, and INV-7 means every
+///   generation died with it);
+/// * a session whose `absolute_exp` is past `dead_before` — the hard ceiling has
+///   passed, so no cookie for it can ever authenticate again, tombstoned or not;
+/// * a txn older than `txn_before` — INV-3's 10-minute single-use window.
+///
+/// A tombstoned row with a NULL `tombstoned_at` (killed before schema v4) is
+/// judged on `absolute_exp` alone. Treating unknown as "old enough" would delete
+/// on a guess, and this is not the code to guess in.
+///
+/// Custody rows go last and only when NO session references them: the FK points
+/// that way, one custody can back several sessions, and an orphaned custody is
+/// both dead weight and an encrypted refresh token nobody can use — so removing
+/// it shrinks the credential material at rest.
+///
+/// **The audit record is what survives this.** Reaping a session removes the row
+/// that a session existed; `session.created` / `session.logged_out` in the
+/// `audit` table are the history, and they have their own, longer retention.
+pub fn reap(
+    conn: &Connection,
+    dead_before: Timestamp,
+    txn_before: Timestamp,
+) -> Result<ReapOutcome, RepoError> {
+    const DOOMED: &str = "SELECT sid FROM session
+                           WHERE (status = 'tombstoned' AND tombstoned_at IS NOT NULL
+                                  AND tombstoned_at < ?1)
+                              OR absolute_exp < ?1";
+
+    // Generations first: `generation.sid` is a foreign key onto `session`, and
+    // `foreign_keys` is ON, so the other order fails the whole transaction.
+    let generations = conn.execute(
+        &format!("DELETE FROM generation WHERE sid IN ({DOOMED})"),
+        params![dead_before.secs()],
+    )?;
+    let sessions = conn.execute(
+        &format!("DELETE FROM session WHERE sid IN ({DOOMED})"),
+        params![dead_before.secs()],
+    )?;
+    let txns = conn.execute(
+        "DELETE FROM txn WHERE created_at < ?1",
+        params![txn_before.secs()],
+    )?;
+    let custodies = conn.execute(
+        "DELETE FROM custody
+          WHERE custody_id NOT IN (SELECT custody_id FROM session)",
+        [],
+    )?;
+
+    Ok(ReapOutcome {
+        generations,
+        sessions,
+        txns,
+        custodies,
+    })
 }
 
 // ---------------------------------------------------------------------

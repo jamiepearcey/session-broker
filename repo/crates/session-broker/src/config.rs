@@ -75,6 +75,9 @@ pub struct BrokerConfig {
     pub metrics_enabled: bool,
     /// The audit plane (ADR-0015).
     pub audit: crate::audit::AuditConfig,
+    /// How long a provably-dead session row is kept before the reaper removes
+    /// it (M6). `0` disables reaping — the pre-M6 behaviour, and unbounded.
+    pub reap_after_secs: u64,
 }
 
 impl BrokerConfig {
@@ -218,6 +221,13 @@ impl BrokerConfig {
         };
         let metrics_enabled = parse_bool(sources, "metrics_enabled", true)?;
 
+        // A day, not an hour. Dead rows are inert, and keeping them briefly is
+        // what lets an operator answer "what happened to that session?" from the
+        // store rather than only from the audit trail. The audit rows outlive
+        // them by design (90 days), so the history is not what is being pruned
+        // here — only the working set.
+        let reap_after_secs = parse_field(sources, "reap_after_secs", "86400")?;
+
         let audit = crate::audit::AuditConfig {
             retention_days: parse_field(sources, "audit_retention_days", "90")?,
             queue_capacity: parse_field(sources, "audit_queue_capacity", "8192")?,
@@ -254,6 +264,7 @@ impl BrokerConfig {
             log,
             metrics_enabled,
             audit,
+            reap_after_secs,
         })
     }
 }

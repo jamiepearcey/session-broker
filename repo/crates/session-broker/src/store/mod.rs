@@ -24,7 +24,7 @@ pub mod writer;
 
 /// Schema version this binary knows how to reach. Bump this and append to
 /// [`MIGRATIONS`] together — the two must stay the same length.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Forward-only migration steps, applied in order inside one transaction at
 /// boot. `store::migrate` tracks how far a given database file has already
@@ -122,6 +122,22 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX audit_by_time ON audit(at DESC);
     CREATE INDEX audit_by_action ON audit(action, at DESC);
     CREATE INDEX audit_by_subject ON audit(subject, at DESC);
+    "#,
+    // v4 — `tombstoned_at`, so dead rows can actually be reaped (M6).
+    //
+    // Until now `tombstone_session` set `status` and nothing else, so there was
+    // no answer to "how long has this been dead?" — and a retention policy needs
+    // the timestamp of the event it retains from. Without it the `session` and
+    // `generation` tables grew without bound: they are inert (`rehydrate` loads
+    // only `alive` rows) but they are also the largest tables in the file, and
+    // each dead session pins a `custody` row holding an encrypted refresh token.
+    //
+    // NULL for rows tombstoned before this migration. The reaper treats NULL as
+    // "unknown, so use `absolute_exp` instead" rather than as "reap now" —
+    // guessing old on a delete path is the wrong direction to be wrong in.
+    r#"
+    ALTER TABLE session ADD COLUMN tombstoned_at INTEGER;
+    CREATE INDEX session_dead ON session(tombstoned_at) WHERE status = 'tombstoned';
     "#,
 ];
 

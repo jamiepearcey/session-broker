@@ -22,9 +22,7 @@
 //!
 //! * The `/proxy/*` browser lane (ADR-0007's other half) is not built. Nothing
 //!   depends on it: backends use `/internal/token`.
-//! * The reaper (M6) does not run, so tombstoned session rows and expired txns
-//!   accumulate on disk. They are inert — `rehydrate` only loads `alive` rows —
-//!   but the file grows.
+//! * The `/proxy/*` browser lane is the only piece still unbuilt; see above.
 
 use std::sync::Arc;
 
@@ -50,6 +48,14 @@ const KEEPALIVE_IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(
 /// 90-day window needs; the point is that a broker which has been up for months
 /// never accumulates a day's worth of overdue rows to delete in one transaction.
 const AUDIT_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How often the reaper sweeps. Frequent enough that a busy deployment never
+/// accumulates a big deletion, rare enough to cost nothing while idle.
+const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// INV-3's login-transaction TTL. A txn older than this is single-use-expired
+/// and can never be redeemed, so it is pure residue.
+const TXN_TTL_SECS: u64 = 600;
 
 /// How often a due verbosity override is checked for expiry. The deadline is
 /// enforced by a timer rather than on the next admin request, because the
@@ -247,6 +253,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // keeping its own promises: the retention window is real, and a raised log
     // level comes back down on its own.
     tokio::spawn(run_audit_pruner(audit.clone(), clock.clone()));
+    tokio::spawn(run_reaper(
+        writer_handle.clone(),
+        sessions.clone(),
+        clock.clone(),
+        config.reap_after_secs,
+    ));
     tokio::spawn(run_log_override_expiry(log.clone(), clock.clone()));
 
     let public = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -264,6 +276,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // not lose the last batch.
     drop(writer);
     Ok(())
+}
+
+/// The reaper (M6): drop what is provably dead, in memory and on disk.
+///
+/// Two halves that must both run. `SessionMap::sweep` frees the in-memory
+/// entries — otherwise a long-running broker holds every session it has ever
+/// issued — and the store command removes the durable rows. Neither is a
+/// substitute for the other: memory is rebuilt from disk on restart, and disk
+/// is never re-read while running.
+async fn run_reaper(
+    writer: session_broker::store::writer::WriterHandle,
+    sessions: Arc<SessionMap>,
+    clock: Arc<dyn Clock>,
+    reap_after_secs: u64,
+) {
+    if reap_after_secs == 0 {
+        // Loud, because the consequence is unbounded and silent: the session and
+        // generation tables are the largest in the file, and every dead session
+        // pins a custody row holding an encrypted refresh token.
+        tracing::warn!(
+            target: "broker::reaper",
+            "reap_after_secs = 0: dead session rows are never removed and the store grows without bound"
+        );
+        return;
+    }
+    loop {
+        let now = clock.now();
+        let (dropped_sessions, retired_gens) = sessions.sweep(now);
+        if dropped_sessions > 0 || retired_gens > 0 {
+            tracing::debug!(
+                target: "broker::reaper",
+                dropped_sessions,
+                retired_gens,
+                "in-memory sweep"
+            );
+        }
+        writer.enqueue(session_broker::store::writer::Command::Reap {
+            dead_before: Timestamp(now.secs() - reap_after_secs as i64),
+            txn_before: Timestamp(now.secs() - TXN_TTL_SECS as i64),
+        });
+        tokio::time::sleep(REAP_INTERVAL).await;
+    }
 }
 
 /// Prune audit rows past the retention window (ADR-0015).
