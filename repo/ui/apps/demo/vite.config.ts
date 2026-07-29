@@ -18,6 +18,13 @@ const MOCK_IDP_BASE_URL = process.env['MOCK_IDP_BASE_URL'] ?? 'http://127.0.0.1:
 export default defineConfig({
   plugins: [react()],
   server: {
+    // Bind IPv4 explicitly, for the same reason the proxy targets above do.
+    // Vite defaults to `localhost`, which resolves to `::1` on macOS and on
+    // Node >=17 — so the dev server ends up somewhere the broker's own
+    // redirect URLs do not point (the SDK follows the broker's `login_url`, which is built from `base_url`), and a login bounces off
+    // ERR_CONNECTION_REFUSED at 127.0.0.1 while the same page loads fine over
+    // `localhost`. Matching the broker's family removes the whole class.
+    host: '127.0.0.1',
     port: 5180,
     proxy: {
       '/session': { target: BROKER_BASE_URL, changeOrigin: true },

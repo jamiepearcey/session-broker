@@ -82,8 +82,9 @@ Milestones are defined in
       generations used concurrently from different IP prefixes — needs the
       per-generation `client_ip_prefix` the `session.meta` column was reserved
       for, and is not wired.)*
-- [ ] **M9 ★** race/multi-tab harness (concurrency + Playwright)
-- [ ] Browser verification of `repo/ui/` against the running broker
+- [ ] **M9 ★** the race/multi-tab harness as an AUTOMATED test. The behaviours
+      are now browser-verified by hand (below); what is missing is a Playwright
+      spec in CI so a regression is caught rather than noticed.
 
 ## Closed since (2026-07-29)
 
@@ -104,6 +105,25 @@ Milestones are defined in
       generations, 2 custodies; the live session survived and was still usable;
       and **5 audit rows still describe all 3 sessions**, which is the design
       working — the store keeps a working set, the audit record keeps the history.
+
+- [x] **Demo app browser-verified against a running broker.** The longest-open
+      item: every claim in `repo/ui/apps/demo` had only ever run against mocked
+      `fetch`/`navigator.locks`.
+
+      | Claim | Result |
+      |---|---|
+      | Login through the SPA, all three clocks | ✅ 10 min gen / 7 d idle / 30 d absolute |
+      | **Forced race — the headline property** | ✅ 20 concurrent → **20 succeeded, 0 failed, 1 generation minted**, 11.2 ms |
+      | Web Lock leader, two tabs | ✅ exactly one leader |
+      | Leader promotion when the leader closes | ✅ survivor promoted and opened the SSE stream (ADR-0008) |
+      | `session.killed` over SSE | ✅ admin revoke → `admin_revoked` reason, tab flipped to Expired instantly (ADR-0013) |
+      | Stale cookie from a previous broker instance | ✅ 401 → cleared → anonymous, no wedged state |
+
+      One fix fell out: both Vite dev servers now bind `127.0.0.1` explicitly.
+      Vite defaults to `localhost` (`::1` on macOS) while the broker binds IPv4,
+      so a login built from `base_url` bounced off ERR_CONNECTION_REFUSED while
+      the same page loaded fine — the proxy *targets* already carried a comment
+      about this; the server's own bind did not.
 
 ## Known gaps, stated plainly
 
