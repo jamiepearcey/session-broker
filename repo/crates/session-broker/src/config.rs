@@ -78,6 +78,57 @@ pub struct BrokerConfig {
     /// How long a provably-dead session row is kept before the reaper removes
     /// it (M6). `0` disables reaping — the pre-M6 behaviour, and unbounded.
     pub reap_after_secs: u64,
+    /// Rate limiting (M6). See [`crate::ratelimit`] for why the client-IP
+    /// source has to be named rather than inferred.
+    pub rate_limit: RateLimitConfig,
+    /// Largest request body any endpoint reads (`http::hardening`).
+    pub max_body_bytes: usize,
+    /// Handler deadline in seconds; `0` disables it. The SSE stream is exempt.
+    pub request_timeout_secs: u64,
+    /// How long shutdown waits for in-flight requests before giving up and
+    /// flushing the store anyway. Long-lived SSE streams never finish on their
+    /// own, so without a bound a deploy would hang on the first open tab.
+    pub shutdown_grace_secs: u64,
+    /// Pause between `/readyz` going 503 and the listeners closing, so a load
+    /// balancer or Kubernetes endpoint controller has time to stop routing here
+    /// first. `0` closes immediately — right for a single node behind nothing.
+    pub shutdown_drain_delay_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    pub enabled: bool,
+    /// Header naming the real client, appended by a trusted proxy. Unset means
+    /// the PUBLIC lane is not limited at all — behind an edge every request
+    /// shares one peer, so keying on it would bucket the whole user base
+    /// together and the first trip would lock everyone out.
+    pub client_ip_header: Option<String>,
+    /// `/auth/login` starts a server-side transaction per call (INV-3).
+    pub login_burst: u32,
+    pub login_per_secs: u64,
+    /// Wrong admin key or wrong backend API key. Both are shared secrets with
+    /// no lockout of their own.
+    pub auth_failure_burst: u32,
+    pub auth_failure_per_secs: u64,
+    /// Distinct keys tracked per limiter before it fails closed.
+    pub max_tracked: usize,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> RateLimitConfig {
+        RateLimitConfig {
+            enabled: true,
+            client_ip_header: None,
+            login_burst: 30,
+            login_per_secs: 60,
+            // Ten wrong keys a minute leaves an operator fat-fingering a paste
+            // unbothered and makes an online guess against a 32-char secret
+            // hopeless, which is the whole distance this needs to cover.
+            auth_failure_burst: 10,
+            auth_failure_per_secs: 60,
+            max_tracked: 16_384,
+        }
+    }
 }
 
 impl BrokerConfig {
@@ -117,7 +168,15 @@ impl BrokerConfig {
         let issuer_url = sources.get("oidc_issuer_url");
         let client_id = sources.get("oidc_client_id");
         let client_secret = sources.get("oidc_client_secret").map(ClientSecret::new);
-        let redirect_uri = sources.get("oidc_redirect_uri");
+        // The redirect URI must match what is registered at the IdP, which for the
+        // single-origin topology (INV-10) is always this broker's own callback —
+        // so it is derived rather than demanded, and only an unusual edge layout
+        // needs to override it.
+        let redirect_uri = sources.get("oidc_redirect_uri").or_else(|| {
+            issuer_url
+                .is_some()
+                .then(|| format!("{}/auth/callback", base_url.trim_end_matches('/')))
+        });
         let scopes = sources
             .get("oidc_scopes")
             .map(|raw| {
@@ -137,6 +196,13 @@ impl BrokerConfig {
         if issuer_url.is_some() && client_secret.is_none() {
             return Err(ConfigError::Invalid {
                 field: "oidc_client_secret",
+                message: "required when oidc_issuer_url is configured".to_owned(),
+            });
+        }
+
+        if issuer_url.is_some() && client_id.is_none() {
+            return Err(ConfigError::Invalid {
+                field: "oidc_client_id",
                 message: "required when oidc_issuer_url is configured".to_owned(),
             });
         }
@@ -228,6 +294,24 @@ impl BrokerConfig {
         // here — only the working set.
         let reap_after_secs = parse_field(sources, "reap_after_secs", "86400")?;
 
+        let max_body_bytes = parse_field(sources, "max_body_bytes", "65536")?;
+        let request_timeout_secs = parse_field(sources, "request_timeout_secs", "30")?;
+        let shutdown_grace_secs = parse_field(sources, "shutdown_grace_secs", "15")?;
+        let shutdown_drain_delay_secs = parse_field(sources, "shutdown_drain_delay_secs", "0")?;
+
+        let defaults = RateLimitConfig::default();
+        let rate_limit = RateLimitConfig {
+            enabled: parse_bool(sources, "rate_limit_enabled", defaults.enabled)?,
+            client_ip_header: sources
+                .get("rate_limit_client_ip_header")
+                .map(|h| h.to_ascii_lowercase()),
+            login_burst: parse_field(sources, "rate_limit_login_burst", "30")?,
+            login_per_secs: parse_field(sources, "rate_limit_login_per_secs", "60")?,
+            auth_failure_burst: parse_field(sources, "rate_limit_auth_failure_burst", "10")?,
+            auth_failure_per_secs: parse_field(sources, "rate_limit_auth_failure_per_secs", "60")?,
+            max_tracked: parse_field(sources, "rate_limit_max_tracked", "16384")?,
+        };
+
         let audit = crate::audit::AuditConfig {
             retention_days: parse_field(sources, "audit_retention_days", "90")?,
             queue_capacity: parse_field(sources, "audit_queue_capacity", "8192")?,
@@ -265,6 +349,11 @@ impl BrokerConfig {
             metrics_enabled,
             audit,
             reap_after_secs,
+            rate_limit,
+            max_body_bytes,
+            request_timeout_secs,
+            shutdown_grace_secs,
+            shutdown_drain_delay_secs,
         })
     }
 }
@@ -581,6 +670,80 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.oidc.client_secret.as_ref().unwrap().expose(), "shh");
+    }
+
+    #[test]
+    fn transport_limits_default_and_can_be_overridden() {
+        let _guard = lock();
+        let cfg = BrokerConfig::from_sources(&sources(&[])).unwrap();
+        assert_eq!(cfg.max_body_bytes, 65_536);
+        assert_eq!(cfg.request_timeout_secs, 30);
+        assert_eq!(cfg.shutdown_grace_secs, 15);
+
+        let cfg = BrokerConfig::from_sources(&sources(&[
+            ("max_body_bytes", "1024"),
+            ("request_timeout_secs", "0"),
+            ("shutdown_grace_secs", "3"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.max_body_bytes, 1024);
+        assert_eq!(cfg.request_timeout_secs, 0);
+        assert_eq!(cfg.shutdown_grace_secs, 3);
+
+        let err = BrokerConfig::from_sources(&sources(&[("max_body_bytes", "lots")])).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                field: "max_body_bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn issuer_without_client_id_fails_at_boot_not_at_first_login() {
+        let _guard = lock();
+        let err = BrokerConfig::from_sources(&sources(&[
+            ("oidc_issuer_url", "https://idp.example.com"),
+            ("oidc_client_secret", "shh"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                field: "oidc_client_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_redirect_uri_defaults_to_this_brokers_own_callback() {
+        let _guard = lock();
+        let cfg = BrokerConfig::from_sources(&sources(&[
+            ("base_url", "https://app.example.com/"),
+            ("oidc_issuer_url", "https://idp.example.com"),
+            ("oidc_client_id", "broker"),
+            ("oidc_client_secret", "shh"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.oidc.redirect_uri.as_deref(),
+            Some("https://app.example.com/auth/callback")
+        );
+
+        let cfg = BrokerConfig::from_sources(&sources(&[
+            ("base_url", "https://app.example.com"),
+            ("oidc_issuer_url", "https://idp.example.com"),
+            ("oidc_client_id", "broker"),
+            ("oidc_client_secret", "shh"),
+            ("oidc_redirect_uri", "https://edge.example.com/cb"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.oidc.redirect_uri.as_deref(),
+            Some("https://edge.example.com/cb")
+        );
     }
 
     #[test]

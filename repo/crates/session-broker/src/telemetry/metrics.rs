@@ -134,6 +134,7 @@ pub struct Metrics {
     session_anomalies: Family<AtomicU64>,
     keepalive_refresh: Family<AtomicU64>,
     keepalive_duration: Histogram,
+    rate_limited: Family<AtomicU64>,
     audit_recorded: Family<AtomicU64>,
     audit_dropped: AtomicU64,
     audit_failed: AtomicU64,
@@ -201,6 +202,14 @@ impl Metrics {
         if let Some(elapsed) = elapsed {
             self.keepalive_duration.observe(elapsed);
         }
+    }
+
+    /// A refusal by the limiter. Worth alerting on a sustained rate: it means
+    /// either an attack or a limit set below what the deployment actually does.
+    pub fn record_rate_limited(&self, lane: &str, bucket: &str) {
+        self.rate_limited
+            .get_or_insert(&[lane, bucket], || AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_audit(&self, tier: &str) {
@@ -300,6 +309,13 @@ impl Metrics {
             "Time spent calling the upstream IdP. The only histogram here that measures the IdP.",
             "",
             &self.keepalive_duration,
+        );
+        counter_family(
+            &mut out,
+            "broker_rate_limited_total",
+            "Requests refused by the rate limiter, by lane and bucket.",
+            &["lane", "bucket"],
+            &self.rate_limited,
         );
         counter_family(
             &mut out,

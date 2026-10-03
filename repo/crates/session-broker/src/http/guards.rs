@@ -190,3 +190,110 @@ mod tests {
         assert_eq!(safe_return_to(None), None);
     }
 }
+
+/// The transport peer, if the server was built with connect info.
+///
+/// Infallible on purpose. `ConnectInfo` itself rejects when connect info was not
+/// installed, which would turn every handler that wants a peer address into one
+/// that 500s in the unit tests that call it through `oneshot`. Returning `None`
+/// instead keeps "no peer available" a state the caller reasons about rather
+/// than an error, which is what it actually is.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAddr(pub Option<std::net::SocketAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(PeerAddr(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|c| c.0),
+        ))
+    }
+}
+
+/// Rate-limit state shared by a lane's handlers.
+///
+/// Held as an `Option` everywhere so the state-machine and cookie tests, which
+/// construct lanes with no limiter, keep compiling and keep meaning the same
+/// thing: no limiter configured is no limiting, not an implicit default.
+#[derive(Clone)]
+pub struct RateLimit {
+    pub limiter: std::sync::Arc<crate::ratelimit::Limiter>,
+    pub source: crate::ratelimit::ClientSource,
+    pub metrics: std::sync::Arc<crate::telemetry::Metrics>,
+    /// Which lane, for the metric label.
+    pub lane: &'static str,
+}
+
+impl std::fmt::Debug for RateLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateLimit")
+            .field("lane", &self.lane)
+            .finish()
+    }
+}
+
+impl RateLimit {
+    /// Spend a token. `Some(response)` means refuse and send it.
+    ///
+    /// A request with no resolvable key is ALLOWED: a configured header that is
+    /// absent means the request did not come through the proxy meant to add it,
+    /// and silently bucketing those together would recreate exactly the
+    /// everyone-in-one-bucket failure the header exists to avoid. It is logged
+    /// so a misconfiguration is visible rather than merely ineffective.
+    pub fn check(
+        &self,
+        peer: Option<&std::net::SocketAddr>,
+        headers: &axum::http::HeaderMap,
+        bucket: &str,
+    ) -> Option<axum::response::Response> {
+        let Some(key) = self.source.key(peer, headers) else {
+            tracing::debug!(
+                target: "broker::ratelimit",
+                lane = self.lane,
+                "no client key could be resolved; request not limited"
+            );
+            return None;
+        };
+        match self.limiter.check(&format!("{bucket}:{key}")) {
+            crate::ratelimit::Decision::Allow => None,
+            crate::ratelimit::Decision::Deny { retry_after } => {
+                let secs = retry_after.as_secs().max(1);
+                self.metrics.record_rate_limited(self.lane, bucket);
+                // The key is NOT logged: it is a client address, and INV-12
+                // permits only a prefix. The bucket and lane are enough to act
+                // on, and the metric carries the rate.
+                tracing::warn!(
+                    target: "broker::ratelimit",
+                    lane = self.lane,
+                    bucket,
+                    retry_after_secs = secs,
+                    "rate limit tripped"
+                );
+                Some(too_many_requests(secs))
+            }
+        }
+    }
+}
+
+fn too_many_requests(retry_after_secs: u64) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        [(
+            axum::http::header::RETRY_AFTER,
+            retry_after_secs.to_string(),
+        )],
+        axum::Json(serde_json::json!({
+            "error": "rate_limited",
+            "detail": "Too many attempts. Retry after the interval in the Retry-After header."
+        })),
+    )
+        .into_response()
+}

@@ -21,6 +21,7 @@ pub mod authz;
 pub mod error;
 pub mod events;
 pub mod guards;
+pub mod hardening;
 pub mod internal;
 pub mod ops;
 pub mod session;
@@ -221,6 +222,11 @@ pub struct AppState {
     /// have no store behind them.
     pub audit: Option<crate::audit::AuditSink>,
     pub metrics: Arc<crate::telemetry::Metrics>,
+    /// Limits `/auth/login`, which mints a server-side txn per call (INV-3).
+    /// `None` unless a client-IP header is configured — behind an edge every
+    /// request shares one peer, and one bucket for the whole user base is worse
+    /// than no limiting.
+    pub rate_limit: Option<crate::http::guards::RateLimit>,
 }
 
 impl FromRef<AppState> for Arc<HttpConfig> {

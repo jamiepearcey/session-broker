@@ -46,8 +46,10 @@ pub struct LoginQuery {
 /// cookies its opaque id, and sends the browser to the IdP.
 pub async fn login(
     State(state): State<AppState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
     Extension(oidc): Extension<Arc<OidcClient>>,
     Query(query): Query<LoginQuery>,
+    headers: HeaderMap,
 ) -> Response {
     // Absent is fine (no redirect target requested); present-but-unsafe is
     // rejected outright rather than silently downgraded, per the documented
@@ -68,6 +70,15 @@ pub async fn login(
             }
         },
     };
+
+    // Checked AFTER `return_to` validation so a malformed request is refused on
+    // its merits rather than spending someone's budget, and BEFORE the txn is
+    // minted, which is the resource this protects.
+    if let Some(limit) = &state.rate_limit {
+        if let Some(response) = limit.check(peer.as_ref(), &headers, "login") {
+            return response;
+        }
+    }
 
     let now = state.clock.now();
     let (authorize_url, txn) = oidc.begin_login(return_to, now);
@@ -346,6 +357,7 @@ mod tests {
                 custody: None,
                 audit: None,
                 metrics: crate::telemetry::Metrics::new(),
+                rate_limit: None,
             };
             let router = crate::http::router(state).layer(Extension(Arc::new(oidc)));
 

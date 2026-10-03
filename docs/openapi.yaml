@@ -545,6 +545,33 @@ paths:
         "204": { description: "Restored, or there was nothing to restore." }
         "401": { $ref: "#/components/responses/AdminUnauthorised" }
 
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness probe (internal lane).
+      description: |
+        Ready to take traffic, as opposed to `/healthz` (public lane), which says
+        only that the process is up. `200` requires all three of: shutdown has
+        not begun, the store writer thread is still receiving, and the read
+        connection answers a query. Otherwise `503` with the same body, so the
+        orchestrator can route around a broker that would accept logins it
+        cannot persist.
+
+        On SIGTERM this flips to `503` first and the listeners close
+        `shutdown_drain_delay_secs` later. Unauthenticated, by the same decision
+        as `/metrics`.
+      responses:
+        "200":
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+        "503":
+          description: Not ready (draining, or the store is unhealthy).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+
   /metrics:
     get:
       tags: [ops]
@@ -604,6 +631,14 @@ components:
           schema: { $ref: "#/components/schemas/LaneError" }
 
   schemas:
+    Readiness:
+      type: object
+      required: [ready, draining, writer, store]
+      properties:
+        ready: { type: boolean }
+        draining: { type: boolean }
+        writer: { type: boolean, description: The store writer thread is receiving. }
+        store: { type: boolean, description: The read connection answered a query. }
     SessionMeta:
       type: object
       description: |

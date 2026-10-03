@@ -1,6 +1,6 @@
 # Current State
 
-_Last updated: 2026-07-26_
+_Last updated: 2026-10-03_
 
 ## Status
 
@@ -357,19 +357,54 @@ so a login built from `base_url` bounced off ERR_CONNECTION_REFUSED while the
 same page loaded fine over `localhost`. The proxy *targets* in those configs
 already carried a comment about exactly this; the server's own bind did not.
 
+## Added since (2026-10-03) — production hardening (ADR-0016)
+
+The POC gaps: nothing bounded guessing, requests had no size/time limits, SIGTERM
+lost the write-behind queue, `/healthz` could not say the store was dead, and the
+custody key could not be rotated.
+
+- **Rate limiting** (M6, finishing earlier WIP): wrong admin/backend keys keyed on
+  the peer; `/auth/login` keyed on a configured client-IP header and **off
+  without one** (behind an edge every request shares a peer).
+- **`http::hardening`**: 64 KiB body ceiling, 30 s handler deadline (SSE exempt),
+  `no-store`/`nosniff`/CSP/`X-Frame-Options`/CORP, HSTS iff `base_url` is https.
+- **Graceful drain**: SIGTERM → `/readyz` 503 → `shutdown_drain_delay_secs` →
+  stop accepting → wait ≤ `shutdown_grace_secs` → writer flushed.
+- **`GET /readyz`** (internal): not draining + writer alive + store answers.
+- **Custody keyring**: sealed = `01 || key_id || nonce || ct`, AAD = header +
+  `custody:<id>:<column>`; `session-broker rotate-key`; boot-time `Reseal` moves
+  rows to the active key inside the writer transaction. Keyfile with group/other
+  bits is now refused (the module docs claimed this; the code did not).
+- **Config**: `oidc_client_id` required with an issuer; `oidc_redirect_uri`
+  defaults to `<base_url>/auth/callback` (previously an unset one failed at the
+  first login with `NotConfigured`).
+- **`repo/Dockerfile`**, distroless, non-root, state in `/data`.
+
+**Breaking:** sealed values written before this have no header and will not
+open — delete development databases. The keyfile format is backward compatible.
+
+### Verified by running it
+
+| Claim | Result |
+|---|---|
+| Hardening headers on the public lane | ✅ all present, no HSTS on http |
+| `/readyz` | ✅ 200 → **503 `draining:true`** after SIGTERM, before the listener closes |
+| Oversize body | ✅ 413 (200 KB to `/admin/api-keys`) |
+| Admin brute force | ✅ 10×401 then 429 |
+| Drain with an SSE stream held open | ✅ exits at delay + grace (4.09 s), logs the forced close |
+| `rotate-key` + restart | ✅ `resealed=1`; raw column header `01 02`; same `/internal/token` access token still served |
+
+189 crate tests, clippy clean under `-D warnings`.
+
 ## Known gaps that remain
 
-- **The `/proxy/*` browser lane is not built.** ADR-0007's other half. Nothing
-  currently needs it: backends use `/internal/token`, and the platform's chosen
-  topology routes data traffic directly rather than through the broker.
-- **The reaper (M6) does not run.** Tombstoned sessions and expired txn rows
-  accumulate on disk. They are inert — `rehydrate` loads only `alive` rows —
-  but the file grows without bound.
-- **Login transactions are still in-memory.** A restart mid-login costs one
-  retry.
-- ~~Three catalogued audit actions declared but not emitted~~ — **closed
-  2026-07-28.** All of `custody.*` and `login.failed` are emitted, and the
-  keepalive metric families are observed. See below.
+- **Postgres/HA backend** (ADR-0005): readiness and drain make ONE node well
+  behaved; they are not high availability.
+- **The `/proxy/*` browser lane is not built** (ADR-0007's other half). Nothing
+  needs it: backends use `/internal/token`.
+- **Login transactions are in-memory.** A restart mid-login costs one retry.
+- **INV-6a concurrent-IP anomaly** needs a per-generation `client_ip_prefix`.
+- **M9 as a CI Playwright spec** — browser-verified by hand, not automated.
 
 ## Not built, deliberately
 

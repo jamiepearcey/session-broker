@@ -69,6 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // unadorned — which it does, and which is better than installing a
     // subscriber the operator did not ask for in order to complain about the
     // one they did.
+    // Operator subcommands run before anything else is built: they touch only
+    // the keyfile, and must work with the broker stopped.
+    if let Some(code) = run_subcommand(std::env::args().skip(1).collect())? {
+        std::process::exit(code);
+    }
     let config = BrokerConfig::load()?;
     let log = session_broker::telemetry::init(config.log.clone())?;
     let metrics = session_broker::telemetry::Metrics::new();
@@ -104,6 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let writer = Writer::spawn(write_conn);
     let writer_handle = writer.handle();
+    // After a `rotate-key` and restart, move every custody row onto the new key
+    // so the old one can be retired. A no-op when nothing is stale.
+    writer_handle.enqueue(store::writer::Command::Reseal);
     let reader = Arc::new(Reader::new(read_conn));
 
     let audit = session_broker::audit::AuditSink::new(
@@ -159,6 +167,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(custodies = scheduled, "keepalive schedule rebuilt");
     tokio::spawn(run_keepalive(worker, schedule_rx));
 
+    // --- rate limiting (M6) ------------------------------------------------
+    //
+    // Two limiters, because they defend different things at different rates:
+    // login mints a durable transaction, a wrong key is a guess.
+    let rl = &config.rate_limit;
+    let build_limit = |quota: session_broker::ratelimit::Quota,
+                       source: session_broker::ratelimit::ClientSource,
+                       lane: &'static str| {
+        rl.enabled.then(|| http::guards::RateLimit {
+            limiter: Arc::new(session_broker::ratelimit::Limiter::new(
+                quota,
+                rl.max_tracked,
+            )),
+            source,
+            metrics: metrics.clone(),
+            lane,
+        })
+    };
+
+    // The internal lane keys on the PEER: backends connect to it directly, so
+    // the peer is the caller.
+    let internal_rate_limit = build_limit(
+        session_broker::ratelimit::Quota::new(rl.auth_failure_burst, rl.auth_failure_per_secs),
+        session_broker::ratelimit::ClientSource::Peer,
+        "internal",
+    );
+    let admin_rate_limit = build_limit(
+        session_broker::ratelimit::Quota::new(rl.auth_failure_burst, rl.auth_failure_per_secs),
+        session_broker::ratelimit::ClientSource::Peer,
+        "admin",
+    );
+
+    // The public lane needs a configured client-IP header, or it is left OFF.
+    // Behind an edge every request shares one peer, so keying on it would put
+    // the whole user base in one bucket and the first trip would lock everyone
+    // out — strictly worse than not limiting.
+    let public_rate_limit = match (&rl.client_ip_header, rl.enabled) {
+        (Some(header), true) => build_limit(
+            session_broker::ratelimit::Quota::new(rl.login_burst, rl.login_per_secs),
+            session_broker::ratelimit::ClientSource::Header(header.clone()),
+            "public",
+        ),
+        (None, true) => {
+            tracing::info!(
+                "public-lane rate limiting is off: set rate_limit_client_ip_header to the \
+                 header your edge appends (e.g. x-forwarded-for). Without it every request \
+                 shares one peer, so a limiter there would throttle the whole user base together"
+            );
+            None
+        }
+        (_, false) => None,
+    };
+
     let state = AppState {
         sessions: sessions.clone(),
         clock: clock.clone(),
@@ -166,6 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         custody: Some(custody_sink),
         audit: Some(audit.clone()),
         metrics: metrics.clone(),
+        rate_limit: public_rate_limit,
     };
 
     let internal_state = InternalState {
@@ -180,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_touch: Default::default(),
         metrics: metrics.clone(),
         audit: Some(audit.clone()),
+        rate_limit: internal_rate_limit,
     };
     if internal_state.api_key.is_none() {
         tracing::warn!(
@@ -207,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit: Some(audit.clone()),
         log: Some(log.clone()),
         metrics: metrics.clone(),
+        rate_limit: admin_rate_limit,
     };
     if admin_state.admin_key.is_none() {
         tracing::warn!(
@@ -219,21 +283,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut internal_app = http::internal::router(internal_state.clone())
         .merge(http::authz::router(internal_state.clone()))
         .merge(http::admin::router(admin_state));
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ops_state = http::ops::OpsState {
+        metrics: metrics.clone(),
+        events: events.clone(),
+        log: Some(log.clone()),
+        audit: Some(audit.clone()),
+        writer: Some(writer_handle.clone()),
+        draining: draining.clone(),
+    };
+    // `/readyz` is always on; `/metrics` is optional. Both sit on the internal
+    // listener, unauthenticated, next to the lanes the network already has to
+    // protect (see `http::ops`).
+    let mut ops_router =
+        axum::Router::new().route("/readyz", axum::routing::get(http::ops::readyz));
     if config.metrics_enabled {
-        // On the internal listener, unauthenticated, next to the lanes the
-        // network already has to protect (see `http::ops`).
-        internal_app = internal_app.merge(
-            axum::Router::new()
-                .route("/metrics", axum::routing::get(http::ops::metrics))
-                .with_state(internal_state)
-                .layer(Extension(http::ops::OpsState {
-                    metrics: metrics.clone(),
-                    events: events.clone(),
-                    log: Some(log.clone()),
-                    audit: Some(audit.clone()),
-                })),
-        );
+        ops_router = ops_router.route("/metrics", axum::routing::get(http::ops::metrics));
     }
+    internal_app = internal_app.merge(
+        ops_router
+            .with_state(internal_state)
+            .layer(Extension(ops_state)),
+    );
     let internal_app = session_broker::telemetry::http::instrument_router(
         internal_app,
         "internal",
@@ -261,21 +332,151 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     tokio::spawn(run_log_override_expiry(log.clone(), clock.clone()));
 
-    let public = tokio::spawn(async move { axum::serve(listener, app).await });
-    let internal = tokio::spawn(async move { axum::serve(internal_listener, internal_app).await });
+    // Outermost layer on both listeners: body ceiling, handler deadline and
+    // response headers. HSTS is only asserted when this origin really is HTTPS.
+    let hardening = http::hardening::Hardening {
+        max_body_bytes: config.max_body_bytes,
+        request_timeout: std::time::Duration::from_secs(config.request_timeout_secs),
+        hsts: false,
+    };
+    let app = http::hardening::apply(
+        app,
+        http::hardening::Hardening {
+            hsts: config.base_url.starts_with("https://"),
+            ..hardening.clone()
+        },
+    );
+    let internal_app = http::hardening::apply(internal_app, hardening);
 
-    // Either listener dying is fatal. A broker serving logins but not token
-    // exchange (or the reverse) is half-broken in a way that looks healthy to
-    // anything checking only one of them.
+    // One signal, observed by both listeners and by the main task. `draining`
+    // flips first so `/readyz` fails while in-flight requests still finish.
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn({
+        let draining = draining.clone();
+        let delay = std::time::Duration::from_secs(config.shutdown_drain_delay_secs);
+        async move {
+            shutdown_signal().await;
+            draining.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Unready first, closed later: see `shutdown_drain_delay_secs`.
+            tokio::time::sleep(delay).await;
+            let _ = stop_tx.send(true);
+        }
+    });
+    let stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|stop| *stop).await;
+    };
+
+    // `into_make_service_with_connect_info` is what puts the peer address in
+    // request extensions; without it `guards::PeerAddr` is always `None` and
+    // every limiter silently does nothing.
+    let mut public = tokio::spawn({
+        let stop = stopped(stop_rx.clone());
+        async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop)
+            .await
+        }
+    });
+    let mut internal = tokio::spawn({
+        let stop = stopped(stop_rx.clone());
+        async move {
+            axum::serve(
+                internal_listener,
+                internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop)
+            .await
+        }
+    });
+
+    // Either listener dying on its own is fatal. A broker serving logins but not
+    // token exchange (or the reverse) is half-broken in a way that looks healthy
+    // to anything checking only one of them. `biased` so a requested shutdown is
+    // never mistaken for that.
     tokio::select! {
-        result = public => result??,
-        result = internal => result??,
+        biased;
+        _ = stop_rx.wait_for(|stop| *stop) => {
+            let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
+            tracing::info!(grace_secs = config.shutdown_grace_secs, "shutdown requested; draining");
+            let drained = async {
+                let _ = tokio::join!(&mut public, &mut internal);
+            };
+            // Open SSE streams never end by themselves, so the drain is bounded:
+            // better to cut them than to be SIGKILLed mid-flush by the
+            // orchestrator, which is what loses the write-behind queue.
+            if tokio::time::timeout(grace, drained).await.is_err() {
+                tracing::warn!("drain did not finish within the grace period; closing anyway");
+            }
+        }
+        result = &mut public => result??,
+        result = &mut internal => result??,
     }
 
     // Dropping the writer flushes and joins its thread, so a graceful exit does
     // not lose the last batch.
     drop(writer);
     Ok(())
+}
+
+/// `session-broker rotate-key` — add a fresh custody key and make it active.
+///
+/// Returns `Some(exit_code)` when a subcommand ran, `None` to start the server.
+fn run_subcommand(args: Vec<String>) -> Result<Option<i32>, Box<dyn std::error::Error>> {
+    let Some(command) = args.first() else {
+        return Ok(None);
+    };
+    match command.as_str() {
+        "rotate-key" => {
+            let config = BrokerConfig::load()?;
+            let id = store::crypto::rotate_keyfile(&config.keyfile_path)?;
+            println!(
+                "key {id} is now the active key in {}.\n\
+                 Restart the broker: at boot it reseals every stored upstream token under it.\n\
+                 Keep the old keys in the file until the log reports no unreadable rows \
+                 and a restart reseals 0; only then may they be removed.",
+                config.keyfile_path.display()
+            );
+            Ok(Some(0))
+        }
+        "help" | "--help" | "-h" => {
+            println!(
+                "session-broker [rotate-key]\n\n  (no argument)  run the broker\n  rotate-key     \
+                 generate a new custody encryption key and make it the active one"
+            );
+            Ok(Some(0))
+        }
+        other => {
+            eprintln!("unknown argument {other:?}; try `session-broker help`");
+            Ok(Some(2))
+        }
+    }
+}
+
+/// Resolves on SIGTERM (what an orchestrator sends) or Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "could not install the SIGTERM handler; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// The reaper (M6): drop what is provably dead, in memory and on disk.

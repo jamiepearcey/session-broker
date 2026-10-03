@@ -29,6 +29,7 @@ Read these files before making changes:
 - [ADR-0013: Session event stream (SSE) as a hint channel](decisions/ADR-0013-session-event-stream.md)
 - [ADR-0014: Observability is two planes — lossy diagnostics and a durable audit record](decisions/ADR-0014-observability-two-planes.md)
 - [ADR-0015: The audit record is a table in the broker's own store, kept for a bounded window and surfaced in the console](decisions/ADR-0015-durable-audit-record-with-retention.md)
+- [ADR-0016: Production hardening — rate limits, transport limits, graceful drain, readiness, rotatable custody keyring](decisions/ADR-0016-production-hardening.md)
 
 ## Context files
 

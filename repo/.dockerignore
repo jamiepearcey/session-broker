@@ -1,0 +1,6 @@
+target
+ui/node_modules
+*.db
+*.db-shm
+*.db-wal
+*.key

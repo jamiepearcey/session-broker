@@ -65,6 +65,8 @@ pub struct InternalState {
     pub metrics: Arc<crate::telemetry::Metrics>,
     /// `None` in the unit tests that build a lane with no store behind it.
     pub audit: Option<crate::audit::AuditSink>,
+    /// Limits WRONG-key attempts (M6). `None` in tests.
+    pub rate_limit: Option<crate::http::guards::RateLimit>,
 }
 
 /// How often a key's `last_used_at` is refreshed.
@@ -235,6 +237,7 @@ impl Refusal {
 
 async fn exchange(
     State(state): State<InternalState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
     headers: HeaderMap,
     Json(request): Json<TokenRequest>,
 ) -> Response {
@@ -282,6 +285,17 @@ async fn exchange(
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(refusal) => {
+            // Only a CREDENTIAL failure counts against the budget. A valid
+            // backend whose user's session has simply expired is not guessing,
+            // and throttling it would turn an ordinary 401 into an outage for
+            // that service.
+            if matches!(refusal.error, "bad_api_key" | "missing_api_key") {
+                if let Some(limit) = &state.rate_limit {
+                    if let Some(response) = limit.check(peer.as_ref(), &headers, "backend_auth") {
+                        return response;
+                    }
+                }
+            }
             state.metrics.record_token_exchange(refusal.error);
             if let Some(sink) = &state.audit {
                 let mut event = crate::audit::Event::new(
@@ -515,6 +529,7 @@ mod tests {
             last_touch: Default::default(),
             metrics: crate::telemetry::Metrics::new(),
             audit: None,
+            rate_limit: None,
         };
 
         Harness {
@@ -624,6 +639,7 @@ mod tests {
             last_touch: Default::default(),
             metrics: crate::telemetry::Metrics::new(),
             audit: None,
+            rate_limit: None,
         };
         let response = router(state)
             .oneshot(request(Some(API_KEY), "anything"))

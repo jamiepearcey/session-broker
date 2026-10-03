@@ -163,6 +163,11 @@ pub enum Command {
         dead_before: Timestamp,
         txn_before: Timestamp,
     },
+    /// Move custody rows sealed under a retired key onto the active one.
+    /// Enqueued once at boot; a no-op when nothing is stale.
+    Reseal,
+    /// Liveness probe: applies nothing. See [`WriterHandle::is_alive`].
+    Ping,
     /// Internal: stop after committing whatever else is in this batch.
     Shutdown,
 }
@@ -222,6 +227,14 @@ impl std::fmt::Debug for WriterHandle {
 }
 
 impl WriterHandle {
+    /// Whether the writer thread is still receiving. `std::sync::mpsc` reports
+    /// a dropped receiver only by failing a send, so this sends a no-op. A dead
+    /// writer means every session mutation is being silently dropped — the
+    /// broker must stop advertising itself as ready.
+    pub fn is_alive(&self) -> bool {
+        self.tx.send(Command::Ping).is_ok()
+    }
+
     /// Write-behind: enqueue and return immediately.
     pub fn enqueue(&self, cmd: Command) {
         // A send failure here means the writer thread is gone (process
@@ -542,6 +555,27 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                     }
                     admin_acks.push((ack, outcome));
                 }
+                Command::Reseal => {
+                    let report = repo::reseal_custody(&tx)?;
+                    if report.resealed > 0 || report.failed > 0 {
+                        tracing::info!(
+                            target: "broker::keys",
+                            resealed = report.resealed,
+                            already_current = report.current,
+                            unreadable = report.failed,
+                            "custody reseal under the active key"
+                        );
+                    }
+                    if report.failed > 0 {
+                        tracing::error!(
+                            target: "broker::keys",
+                            unreadable = report.failed,
+                            "custody rows could not be opened with any key in the keyfile; \
+                             they were left untouched"
+                        );
+                    }
+                }
+                Command::Ping => {}
                 Command::Shutdown => {
                     shutdown = true;
                 }
