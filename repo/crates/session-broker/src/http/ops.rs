@@ -44,6 +44,51 @@ pub struct OpsState {
     pub events: Arc<SessionEvents>,
     pub log: Option<Arc<LogControl>>,
     pub audit: Option<AuditSink>,
+    /// Handle to the writer thread, for the readiness probe.
+    pub writer: Option<crate::store::writer::WriterHandle>,
+    /// Set when shutdown begins, so `/readyz` fails and the load balancer stops
+    /// sending new work while in-flight requests finish.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// `GET /readyz` — ready to take traffic, as distinct from `/healthz`, which
+/// says only that the process is up.
+///
+/// Three things must hold: shutdown has not begun, the writer thread is still
+/// receiving (otherwise every session mutation is being dropped on the floor),
+/// and the read connection can answer a query. A broker failing any of them is
+/// worse than absent — it accepts logins it cannot persist — so it reports
+/// itself unready and lets the orchestrator route around it.
+pub async fn readyz(
+    State(internal): State<InternalState>,
+    Extension(ops): Extension<OpsState>,
+) -> Response {
+    use axum::http::StatusCode;
+    use std::sync::atomic::Ordering;
+
+    let draining = ops.draining.load(Ordering::Relaxed);
+    let writer_ok = ops.writer.as_ref().is_none_or(|w| w.is_alive());
+    let store_ok = internal.reader.with(|conn| {
+        conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .is_ok()
+    });
+
+    let ready = !draining && writer_ok && store_ok;
+    let body = serde_json::json!({
+        "ready": ready,
+        "draining": draining,
+        "writer": writer_ok,
+        "store": store_ok,
+    });
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        axum::Json(body),
+    )
+        .into_response()
 }
 
 pub async fn metrics(

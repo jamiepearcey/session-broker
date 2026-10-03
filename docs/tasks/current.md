@@ -71,12 +71,16 @@ Milestones are defined in
       without declaring `@types/node` (declared — a Vite config really does run
       in Node, which is the opposite call to the `Buffer` one).
 
+- [x] **Production hardening (ADR-0016).** Transport limits + security headers,
+      graceful drain, `/readyz`, rotatable custody keyring (`rotate-key`, boot
+      reseal), keyfile permission enforcement, OIDC config validation, Dockerfile.
+
 ## Next
 
 - [ ] **M5b ⚙** the `/proxy/*` browser lane. Deliberately deferred: the
       platform routes data traffic directly to services, which authenticate
       via `/internal/token`, so nothing needs the proxy today.
-- [ ] **M6 ⚙** rate limiting. *(The reaper is DONE — see below. Anomaly events are recorded:
+- [x] **M6 ⚙** rate limiting — done, see ADR-0016. *(The reaper is DONE — see below. Anomaly events are recorded:
       superseded- and retired-generation use emit `session.anomaly` rows and
       `broker_session_anomalies_total`. The remaining INV-6a signal — two
       generations used concurrently from different IP prefixes — needs the

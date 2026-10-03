@@ -20,6 +20,7 @@ pub mod custody;
 pub mod http;
 pub mod keepalive;
 pub mod oauth;
+pub mod ratelimit;
 pub mod session;
 pub mod store;
 pub mod telemetry;

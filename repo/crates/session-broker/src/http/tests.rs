@@ -37,6 +37,7 @@ impl Harness {
             custody: None,
             audit: None,
             metrics: crate::telemetry::Metrics::new(),
+            rate_limit: None,
         };
         Harness {
             router: router(state),

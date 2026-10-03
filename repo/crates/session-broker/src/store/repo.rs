@@ -34,6 +34,7 @@ pub enum RepoError {
 // thin aliases here so every call site in this module reads the same as it did
 // when these were placeholders — the boundary was designed for exactly this
 // substitution.
+use super::crypto::{context, key_id_of, KeyRing};
 pub(crate) use super::crypto::{open, seal};
 
 // ---------------------------------------------------------------------
@@ -115,8 +116,8 @@ pub fn insert_custody(conn: &Connection, row: &CustodyRow) -> Result<(), RepoErr
         params![
             row.custody_id.0,
             row.sub,
-            seal(&row.refresh_tok),
-            seal(&row.access_tok),
+            seal(&row.refresh_tok, &context(&row.custody_id.0, "refresh")),
+            seal(&row.access_tok, &context(&row.custody_id.0, "access")),
             row.access_exp.secs(),
             row.scope,
             custody_status_to_str(row.status),
@@ -126,6 +127,74 @@ pub fn insert_custody(conn: &Connection, row: &CustodyRow) -> Result<(), RepoErr
         ],
     )?;
     Ok(())
+}
+
+/// What a [`reseal_custody`] pass found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResealReport {
+    /// Rows moved from an older key to the active one.
+    pub resealed: usize,
+    /// Rows already under the active key.
+    pub current: usize,
+    /// Rows that would not open (wrong/removed key, or altered). Left untouched:
+    /// rewriting what cannot be read would destroy the only copy.
+    pub failed: usize,
+}
+
+/// Re-encrypt every custody row still sealed under a retired key.
+///
+/// Run inside the writer's transaction, so it cannot interleave with a
+/// keepalive rotation: the row it reads is the row it rewrites. That matters
+/// because a refresh token regressing to an older value is an unrecoverable
+/// loss of the grant at an IdP that rotates them.
+pub fn reseal_custody(conn: &Connection) -> Result<ResealReport, RepoError> {
+    reseal_custody_with(conn, super::crypto::ring())
+}
+
+pub(crate) fn reseal_custody_with(
+    conn: &Connection,
+    ring: &KeyRing,
+) -> Result<ResealReport, RepoError> {
+    let active = ring.active_id();
+    let mut report = ResealReport::default();
+    let mut stmt = conn.prepare("SELECT custody_id, refresh_tok, access_tok FROM custody")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (custody_id, refresh, access) in rows {
+        if key_id_of(&refresh) == Some(active) && key_id_of(&access) == Some(active) {
+            report.current += 1;
+            continue;
+        }
+        let refresh_ctx = context(&custody_id, "refresh");
+        let access_ctx = context(&custody_id, "access");
+        match (
+            ring.open(&refresh, &refresh_ctx),
+            ring.open(&access, &access_ctx),
+        ) {
+            (Ok(refresh_plain), Ok(access_plain)) => {
+                conn.execute(
+                    "UPDATE custody SET refresh_tok = ?1, access_tok = ?2 WHERE custody_id = ?3",
+                    params![
+                        ring.seal(&refresh_plain, &refresh_ctx),
+                        ring.seal(&access_plain, &access_ctx),
+                        custody_id
+                    ],
+                )?;
+                report.resealed += 1;
+            }
+            _ => report.failed += 1,
+        }
+    }
+    Ok(report)
 }
 
 pub fn load_custody(
@@ -170,11 +239,15 @@ pub fn load_custody(
         return Ok(None);
     };
 
+    let refresh_plain =
+        open(&refresh_tok, &context(&custody_id, "refresh")).map_err(RepoError::Open)?;
+    let access_plain =
+        open(&access_tok, &context(&custody_id, "access")).map_err(RepoError::Open)?;
     Ok(Some(CustodyRow {
         custody_id: CustodyId(custody_id),
         sub,
-        refresh_tok: open(&refresh_tok).map_err(RepoError::Open)?,
-        access_tok: open(&access_tok).map_err(RepoError::Open)?,
+        refresh_tok: refresh_plain,
+        access_tok: access_plain,
         access_exp: Timestamp(access_exp),
         scope,
         status: custody_status_from_str(&status)?,
@@ -355,8 +428,8 @@ pub fn update_custody_success(
              status = 'ok', fail_count = 0, updated_at = ?5
          WHERE custody_id = ?6",
         params![
-            seal(refresh_tok),
-            seal(access_tok),
+            seal(refresh_tok, &context(&custody_id.0, "refresh")),
+            seal(access_tok, &context(&custody_id.0, "access")),
             access_exp.secs(),
             next_refresh.secs(),
             now.secs(),
@@ -1025,6 +1098,51 @@ mod tests {
             fail_count: 0,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn reseal_moves_rows_off_a_retired_key_and_leaves_unreadable_ones_alone() {
+        let conn = store::open_in_memory().unwrap();
+        let now = Timestamp(1_700_000_000);
+        insert_custody(&conn, &custody_row("cust-old", now)).unwrap();
+        insert_custody(&conn, &custody_row("cust-bad", now)).unwrap();
+
+        // The process ring plus one newer key: the state right after `rotate-key`.
+        // The rows were just written under the older key.
+        let rotated = crate::store::crypto::rotated_for_test();
+        let report = reseal_custody_with(&conn, &rotated).unwrap();
+        assert_eq!(report.resealed, 2);
+        let raw: Vec<u8> = conn
+            .query_row(
+                "SELECT refresh_tok FROM custody WHERE custody_id = 'cust-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_id_of(&raw), Some(2));
+        let again = reseal_custody_with(&conn, &rotated).unwrap();
+        assert_eq!(
+            (again.resealed, again.current),
+            (0, 2),
+            "a second pass is a no-op"
+        );
+
+        // A row that cannot be opened is counted and NOT rewritten.
+        conn.execute(
+            "UPDATE custody SET refresh_tok = x'0101ffff' WHERE custody_id = 'cust-bad'",
+            [],
+        )
+        .unwrap();
+        let failed = reseal_custody_with(&conn, &rotated).unwrap();
+        assert_eq!(failed.failed, 1);
+        let kept: Vec<u8> = conn
+            .query_row(
+                "SELECT refresh_tok FROM custody WHERE custody_id = 'cust-bad'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, vec![1, 1, 255, 255]);
     }
 
     #[test]

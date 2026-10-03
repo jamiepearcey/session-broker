@@ -56,6 +56,8 @@ pub struct AdminState {
     /// subscriber.
     pub log: Option<Arc<LogControl>>,
     pub metrics: Arc<Metrics>,
+    /// Limits WRONG-key attempts (M6). `None` in tests.
+    pub rate_limit: Option<crate::http::guards::RateLimit>,
 }
 
 /// The admin actor for an audited row.
@@ -97,7 +99,17 @@ pub fn router(state: AdminState) -> Router {
 ///
 /// `Box`ed because an `axum::Response` is a large `Err` variant to carry
 /// around by value on every call.
-fn authorised(state: &AdminState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+/// Every handler starts here.
+///
+/// Rate limiting is applied to FAILURES only, deliberately. A console polling
+/// its own views with a valid key is ordinary traffic and must not be throttled;
+/// what needs a ceiling is guessing, and only a wrong key is a guess. It also
+/// means an operator can never lock themselves out by using the tool normally.
+fn authorised(
+    state: &AdminState,
+    headers: &HeaderMap,
+    peer: Option<&std::net::SocketAddr>,
+) -> Result<(), Box<Response>> {
     let Some(expected) = state.admin_key.as_deref() else {
         return Err(Box::new(refuse(
             StatusCode::NOT_IMPLEMENTED,
@@ -112,11 +124,18 @@ fn authorised(state: &AdminState, headers: &HeaderMap) -> Result<(), Box<Respons
 
     match presented {
         Some(key) if crate::http::internal::key_matches(key, expected) => Ok(()),
-        _ => Err(Box::new(refuse(
-            StatusCode::UNAUTHORIZED,
-            "unauthorised",
-            "A valid admin API key is required.",
-        ))),
+        _ => {
+            if let Some(limit) = &state.rate_limit {
+                if let Some(response) = limit.check(peer, headers, "admin_auth") {
+                    return Err(Box::new(response));
+                }
+            }
+            Err(Box::new(refuse(
+                StatusCode::UNAUTHORIZED,
+                "unauthorised",
+                "A valid admin API key is required.",
+            )))
+        }
     }
 }
 
@@ -135,8 +154,12 @@ struct ApiKeyView {
     live: bool,
 }
 
-async fn list_keys(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+async fn list_keys(
+    State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
     match state.reader.with(repo::list_api_keys) {
@@ -184,10 +207,11 @@ struct CreateKeyResponse {
 
 async fn create_key(
     State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
     headers: HeaderMap,
     Json(request): Json<CreateKeyRequest>,
 ) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
 
@@ -265,10 +289,11 @@ async fn create_key(
 
 async fn revoke_key(
     State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
     headers: HeaderMap,
     Path(key_id): Path<String>,
 ) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
     let now = state.clock.now();
@@ -326,8 +351,12 @@ struct SessionView {
     absolute_exp: i64,
 }
 
-async fn list_sessions(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+async fn list_sessions(
+    State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
     // Read from the STORE, not the in-memory map: the map holds token hashes,
@@ -361,10 +390,11 @@ async fn list_sessions(State(state): State<AdminState>, headers: HeaderMap) -> R
 /// Force-logout. Kills every generation at once (INV-7), in memory and durably.
 async fn revoke_session(
     State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
     headers: HeaderMap,
     Path(sid): Path<String>,
 ) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
     let now = state.clock.now();
@@ -470,10 +500,11 @@ struct AuditPage {
 
 async fn list_audit(
     State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<AuditParams>,
 ) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
 
@@ -596,8 +627,12 @@ struct ObservabilityView {
     audit_failed_total: u64,
 }
 
-async fn get_observability(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+async fn get_observability(
+    State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
 
@@ -681,10 +716,11 @@ struct LogLevelRequest {
 /// and on a service that logs per platform request the cost of that is real.
 async fn put_log_level(
     State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
     headers: HeaderMap,
     Json(request): Json<LogLevelRequest>,
 ) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
     let Some(log) = &state.log else {
@@ -746,8 +782,12 @@ async fn put_log_level(
 }
 
 /// Put the configured filter back now, rather than waiting for the deadline.
-async fn restore_log_level(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+async fn restore_log_level(
+    State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
     let Some(log) = &state.log else {
@@ -801,8 +841,12 @@ struct CustodyView {
     fail_count: i64,
 }
 
-async fn list_custody(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Err(response) = authorised(&state, &headers) {
+async fn list_custody(
+    State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
         return *response;
     }
     match state.reader.with(repo::live_custody_schedules) {
@@ -867,6 +911,131 @@ mod tests {
         ))
     }
 
+    /// A harness whose admin lane is rate-limited, keyed on a header so the
+    /// test can present distinct "clients" without needing real sockets.
+    fn limited_harness(admin_key: &str, burst: u32) -> (Router, Writer) {
+        let path = temp_db();
+        let _ = std::fs::remove_file(&path);
+        let keyfile = path.with_extension("key");
+        let conn = crate::store::open(&path, &keyfile).unwrap();
+        let reader_conn = crate::store::open(&path, &keyfile).unwrap();
+        let writer = Writer::spawn(conn);
+        let metrics = crate::telemetry::Metrics::new();
+        let state = AdminState {
+            sessions: Arc::new(SessionMap::new(SessionPolicy::default())),
+            reader: Arc::new(Reader::new(reader_conn)),
+            writer: writer.handle(),
+            clock: Arc::new(TestClock::new(T0)),
+            admin_key: Some(Arc::from(admin_key)),
+            audit: None,
+            log: None,
+            metrics: metrics.clone(),
+            rate_limit: Some(crate::http::guards::RateLimit {
+                limiter: Arc::new(crate::ratelimit::Limiter::new(
+                    crate::ratelimit::Quota::new(burst, 60),
+                    128,
+                )),
+                source: crate::ratelimit::ClientSource::Header("x-real-ip".to_owned()),
+                metrics,
+                lane: "admin",
+            }),
+        };
+        (router(state), writer)
+    }
+
+    fn req_from(ip: &str, key: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri("/admin/api-keys")
+            .header("x-real-ip", ip)
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Guessing the admin key must run out of attempts.
+    #[tokio::test]
+    async fn repeated_wrong_admin_keys_are_rate_limited_with_a_retry_after() {
+        let (app, _writer) = limited_harness(ADMIN_KEY, 3);
+
+        for i in 0..3 {
+            let r = app
+                .clone()
+                .oneshot(req_from("203.0.113.5", "wrong"))
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::UNAUTHORIZED,
+                "guess {i} is refused on its merits"
+            );
+        }
+
+        let r = app
+            .clone()
+            .oneshot(req_from("203.0.113.5", "wrong"))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "past the burst the guess never reaches the comparison at all"
+        );
+        assert!(
+            r.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "a 429 without Retry-After tells a client nothing but 'try again sometime'"
+        );
+    }
+
+    /// The property that makes this safe to enable: one attacker must not be
+    /// able to lock the real operator out.
+    #[tokio::test]
+    async fn an_exhausted_attacker_does_not_lock_out_a_different_client() {
+        let (app, _writer) = limited_harness(ADMIN_KEY, 2);
+
+        for _ in 0..3 {
+            let _ = app
+                .clone()
+                .oneshot(req_from("198.51.100.9", "wrong"))
+                .await
+                .unwrap();
+        }
+        let attacker = app
+            .clone()
+            .oneshot(req_from("198.51.100.9", "wrong"))
+            .await
+            .unwrap();
+        assert_eq!(attacker.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let operator = app
+            .clone()
+            .oneshot(req_from("203.0.113.1", ADMIN_KEY))
+            .await
+            .unwrap();
+        assert_eq!(
+            operator.status(),
+            StatusCode::OK,
+            "a different client with the RIGHT key is unaffected"
+        );
+    }
+
+    /// Only failures count. A console polling with a valid key is ordinary
+    /// traffic, and throttling it would mean an operator could lock themselves
+    /// out by using the tool normally.
+    #[tokio::test]
+    async fn a_valid_key_is_never_throttled_however_often_it_is_used() {
+        let (app, _writer) = limited_harness(ADMIN_KEY, 2);
+
+        for i in 0..20 {
+            let r = app
+                .clone()
+                .oneshot(req_from("203.0.113.1", ADMIN_KEY))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "valid request {i} must pass");
+        }
+    }
+
     fn harness(admin_key: Option<&str>) -> (Router, Writer) {
         let path = temp_db();
         let _ = std::fs::remove_file(&path);
@@ -892,6 +1061,7 @@ mod tests {
             // should have.
             log: None,
             metrics,
+            rate_limit: None,
         };
         (router(state), writer)
     }

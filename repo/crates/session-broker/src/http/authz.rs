@@ -217,6 +217,7 @@ mod tests {
             last_touch: Default::default(),
             metrics: crate::telemetry::Metrics::new(),
             audit: None,
+            rate_limit: None,
         };
         (router(state), issued.token.expose_for_cookie().to_owned())
     }
