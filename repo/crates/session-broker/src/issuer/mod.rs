@@ -472,3 +472,6 @@ impl Issuer {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod vectors;

@@ -4,6 +4,11 @@
 
 Accepted (2026-07-26)
 
+Amended by [ADR-0017](ADR-0017-the-broker-as-a-token-issuer.md): the broker now issues
+signed tokens and holds tenants, service principals and user grants as data. Still no
+policy evaluation and still not an IdP; "not multi-tenant" now means no isolation
+boundary inside the broker, not that a token cannot name a tenant.
+
 ## Context
 
 The field splits into IdPs (Ory Kratos, Keycloak, Authentik, Zitadel, Pocket ID)
