@@ -103,6 +103,24 @@ pub enum AdminWrite {
         key_id: String,
         now: Timestamp,
     },
+    /// The first signing key, created at boot when the store has none.
+    InsertSigningKey {
+        key: repo::NewSigningKey,
+        now: Timestamp,
+    },
+    /// A new signing key that takes over at `activate_at`; every key before it
+    /// stops being published at `retire_at`.
+    RotateSigningKey {
+        key: repo::NewSigningKey,
+        now: Timestamp,
+        activate_at: Timestamp,
+        retire_at: Timestamp,
+    },
+    /// The prune: mark one key removed once it is past its `retire_at`.
+    RemoveRetiredSigningKey {
+        kid: String,
+        now: Timestamp,
+    },
 }
 
 /// Write-behind mutations: session/generation/txn housekeeping. Enqueued and
@@ -163,8 +181,9 @@ pub enum Command {
         dead_before: Timestamp,
         txn_before: Timestamp,
     },
-    /// Move custody rows sealed under a retired key onto the active one.
-    /// Enqueued once at boot; a no-op when nothing is stale.
+    /// Move every sealed row (custody tokens, signing-key seeds) off a retired
+    /// key onto the active one. Enqueued once at boot; a no-op when nothing is
+    /// stale.
     Reseal,
     /// Liveness probe: applies nothing. See [`WriterHandle::is_alive`].
     Ping,
@@ -537,6 +556,19 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                         AdminWrite::TouchApiKey { key_id, now } => {
                             repo::touch_api_key(&tx, &key_id, now).map(|()| true)
                         }
+                        AdminWrite::InsertSigningKey { key, now } => {
+                            repo::insert_signing_key(&tx, &key, now, now).map(|()| true)
+                        }
+                        AdminWrite::RotateSigningKey {
+                            key,
+                            now,
+                            activate_at,
+                            retire_at,
+                        } => repo::rotate_signing_key(&tx, &key, now, activate_at, retire_at)
+                            .map(|()| true),
+                        AdminWrite::RemoveRetiredSigningKey { kid, now } => {
+                            repo::remove_retired_signing_key(&tx, &kid, now)
+                        }
                     }?;
 
                     // Tier A: same transaction as the mutation, so there is no
@@ -556,23 +588,29 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                     admin_acks.push((ack, outcome));
                 }
                 Command::Reseal => {
-                    let report = repo::reseal_custody(&tx)?;
-                    if report.resealed > 0 || report.failed > 0 {
-                        tracing::info!(
-                            target: "broker::keys",
-                            resealed = report.resealed,
-                            already_current = report.current,
-                            unreadable = report.failed,
-                            "custody reseal under the active key"
-                        );
-                    }
-                    if report.failed > 0 {
-                        tracing::error!(
-                            target: "broker::keys",
-                            unreadable = report.failed,
-                            "custody rows could not be opened with any key in the keyfile; \
-                             they were left untouched"
-                        );
+                    let all = repo::reseal_all(&tx)?;
+                    for (what, report) in
+                        [("custody", all.custody), ("signing_key", all.signing_keys)]
+                    {
+                        if report.resealed > 0 || report.failed > 0 {
+                            tracing::info!(
+                                target: "broker::keys",
+                                table = what,
+                                resealed = report.resealed,
+                                already_current = report.current,
+                                unreadable = report.failed,
+                                "reseal under the active key"
+                            );
+                        }
+                        if report.failed > 0 {
+                            tracing::error!(
+                                target: "broker::keys",
+                                table = what,
+                                unreadable = report.failed,
+                                "sealed rows could not be opened with any key in the keyfile; \
+                                 they were left untouched"
+                            );
+                        }
                     }
                 }
                 Command::Ping => {}

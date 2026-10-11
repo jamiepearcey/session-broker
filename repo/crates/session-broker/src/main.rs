@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // subscriber the operator did not ask for in order to complain about the
     // one they did.
     // Operator subcommands run before anything else is built: they touch only
-    // the keyfile, and must work with the broker stopped.
+    // the keyfile and the store, and must work with the broker stopped.
     if let Some(code) = run_subcommand(std::env::args().skip(1).collect())? {
         std::process::exit(code);
     }
@@ -122,6 +122,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let now = clock.now();
+
+    // The token issuer's signing keys: loaded, and the first one created if the
+    // store has none. A failure here costs token issuance only — sessions and
+    // custody do not depend on it, so the broker still starts.
+    let issuer = match session_broker::issuer::bootstrap(
+        reader.clone(),
+        writer_handle.clone(),
+        Some(audit.clone()),
+        clock.clone(),
+        session_broker::issuer::KeyPolicy::default(),
+    ) {
+        Ok(issuer) => Some(issuer),
+        Err(e) => {
+            tracing::error!(error = %e, "signing keys could not be loaded; token issuance is off");
+            None
+        }
+    };
 
     let sessions = Arc::new(SessionMap::with_durability(policy, writer_handle.clone()));
     let restored = rehydrate_sessions(&reader, &sessions);
@@ -271,6 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log: Some(log.clone()),
         metrics: metrics.clone(),
         rate_limit: admin_rate_limit,
+        issuer: issuer.clone(),
     };
     if admin_state.admin_key.is_none() {
         tracing::warn!(
@@ -323,7 +341,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Two background timers, both cheap and both about the observability plane
     // keeping its own promises: the retention window is real, and a raised log
     // level comes back down on its own.
-    tokio::spawn(run_audit_pruner(audit.clone(), clock.clone()));
+    tokio::spawn(run_audit_pruner(
+        audit.clone(),
+        issuer.clone(),
+        clock.clone(),
+    ));
     tokio::spawn(run_reaper(
         writer_handle.clone(),
         sessions.clone(),
@@ -421,7 +443,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `session-broker rotate-key` — add a fresh custody key and make it active.
+/// Operator subcommands: `rotate-key` (custody encryption key) and
+/// `rotate-signing-key` (token-signing key).
 ///
 /// Returns `Some(exit_code)` when a subcommand ran, `None` to start the server.
 fn run_subcommand(args: Vec<String>) -> Result<Option<i32>, Box<dyn std::error::Error>> {
@@ -441,10 +464,43 @@ fn run_subcommand(args: Vec<String>) -> Result<Option<i32>, Box<dyn std::error::
             );
             Ok(Some(0))
         }
+        "rotate-signing-key" => {
+            let immediate = match args.get(1).map(String::as_str) {
+                None => false,
+                Some("--now") => true,
+                Some(other) => {
+                    eprintln!("unknown argument {other:?}; `rotate-signing-key` takes only --now");
+                    return Ok(Some(2));
+                }
+            };
+            let config = BrokerConfig::load()?;
+            let rotation = rotate_signing_key(&config, immediate)?;
+            if rotation.immediate {
+                println!(
+                    "signing key {} signs from now, and every older key is no longer published.\n\
+                     Tokens issued before this are invalid; verifiers reject new ones until they \
+                     next refresh their key set.",
+                    rotation.kid
+                );
+            } else {
+                println!(
+                    "signing key {} is published now and starts signing at {} (epoch seconds).\n\
+                     Older keys stay published until {}.",
+                    rotation.kid, rotation.activate_at, rotation.previous_retire_at
+                );
+            }
+            println!("A running broker picks this up within a minute; no restart is needed.");
+            Ok(Some(0))
+        }
         "help" | "--help" | "-h" => {
             println!(
-                "session-broker [rotate-key]\n\n  (no argument)  run the broker\n  rotate-key     \
-                 generate a new custody encryption key and make it the active one"
+                "session-broker [rotate-key | rotate-signing-key [--now]]\n\n  \
+                 (no argument)       run the broker\n  \
+                 rotate-key          generate a new custody encryption key and make it the \
+                 active one\n  \
+                 rotate-signing-key  add a token-signing key that takes over after the publish \
+                 lead (a day);\n                      \
+                 with --now it takes over at once and older keys are unpublished"
             );
             Ok(Some(0))
         }
@@ -453,6 +509,34 @@ fn run_subcommand(args: Vec<String>) -> Result<Option<i32>, Box<dyn std::error::
             Ok(Some(2))
         }
     }
+}
+
+/// `session-broker rotate-signing-key [--now]`: the same rotation as
+/// `POST /admin/signing-keys/rotate`, for when the admin lane is not reachable
+/// or the broker is stopped. It opens the store itself; with a broker running
+/// against the same file the write simply queues behind the broker's own.
+fn rotate_signing_key(
+    config: &BrokerConfig,
+    immediate: bool,
+) -> Result<session_broker::issuer::Rotation, Box<dyn std::error::Error>> {
+    let writer = Writer::spawn(store::open(&config.db_path, &config.keyfile_path)?);
+    let reader = Arc::new(Reader::new(store::open(
+        &config.db_path,
+        &config.keyfile_path,
+    )?));
+    let audit = session_broker::audit::AuditSink::new(
+        writer.handle(),
+        session_broker::telemetry::Metrics::new(),
+        config.audit.clone(),
+    );
+    let issuer = session_broker::issuer::Issuer::open(
+        reader,
+        writer.handle(),
+        Some(audit),
+        Arc::new(SystemClock),
+        session_broker::issuer::KeyPolicy::default(),
+    )?;
+    Ok(issuer.rotate(immediate.then_some(0), "cli")?)
 }
 
 /// Resolves on SIGTERM (what an orchestrator sends) or Ctrl-C.
@@ -522,11 +606,23 @@ async fn run_reaper(
 }
 
 /// Prune audit rows past the retention window (ADR-0015).
-async fn run_audit_pruner(audit: session_broker::audit::AuditSink, clock: Arc<dyn Clock>) {
+///
+/// The same hourly tick removes signing keys past their `retire_at`. That is
+/// separate from audit retention: it runs even when `audit_retention_days = 0`.
+async fn run_audit_pruner(
+    audit: session_broker::audit::AuditSink,
+    issuer: Option<Arc<session_broker::issuer::Issuer>>,
+    clock: Arc<dyn Clock>,
+) {
     loop {
         // Swept at boot as well as hourly: a broker that is restarted more often
         // than the interval would otherwise never prune at all.
         audit.prune(clock.now());
+        if let Some(issuer) = issuer.clone() {
+            // The prune waits on the writer's ack, so it runs off the runtime's
+            // worker threads.
+            let _ = tokio::task::spawn_blocking(move || issuer.prune_retired()).await;
+        }
         tokio::time::sleep(AUDIT_PRUNE_INTERVAL).await;
     }
 }

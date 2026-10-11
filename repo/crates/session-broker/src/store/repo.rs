@@ -151,6 +151,30 @@ pub fn reseal_custody(conn: &Connection) -> Result<ResealReport, RepoError> {
     reseal_custody_with(conn, super::crypto::ring())
 }
 
+/// Every sealed column in the store, moved onto the active key: custody tokens
+/// and signing-key seeds. This is what the boot `Reseal` runs.
+///
+/// One entry point on purpose. A table with a sealed column that the reseal
+/// does not visit keeps its rows under the old key for ever, and the first
+/// anyone hears of it is when that key is deleted from the keyfile.
+pub fn reseal_all(conn: &Connection) -> Result<ResealAll, RepoError> {
+    reseal_all_with(conn, super::crypto::ring())
+}
+
+/// What [`reseal_all`] found, per table.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResealAll {
+    pub custody: ResealReport,
+    pub signing_keys: ResealReport,
+}
+
+pub(crate) fn reseal_all_with(conn: &Connection, ring: &KeyRing) -> Result<ResealAll, RepoError> {
+    Ok(ResealAll {
+        custody: reseal_custody_with(conn, ring)?,
+        signing_keys: reseal_signing_keys_with(conn, ring)?,
+    })
+}
+
 pub(crate) fn reseal_custody_with(
     conn: &Connection,
     ring: &KeyRing,
@@ -360,6 +384,235 @@ pub fn touch_api_key(conn: &Connection, key_id: &str, now: Timestamp) -> Result<
         params![now.secs(), key_id],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// signing_key (v5) — the token issuer's Ed25519 keys
+//
+// No state column. A key is pending, signing or retired by where the clock
+// stands against `activate_at` / `retire_at`; `removed_at` is the only thing
+// a background job ever sets.
+// ---------------------------------------------------------------------
+
+/// The AAD context binding a sealed seed to its key row.
+fn signing_seed_context(kid: &str) -> Vec<u8> {
+    format!("signing:{kid}:seed").into_bytes()
+}
+
+/// A freshly generated key on its way to the store. The seed is plaintext here
+/// and sealed by [`insert_signing_key`]; it is wiped when this is dropped.
+pub struct NewSigningKey {
+    pub kid: String,
+    pub public_key: [u8; 32],
+    pub seed: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for NewSigningKey {
+    // Never prints the seed: this type rides inside `AdminWrite`, which derives
+    // `Debug` (INV-12).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewSigningKey")
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A signing key as anything outside the issuer sees it: no seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningKeyRow {
+    pub kid: String,
+    pub public_key: [u8; 32],
+    pub created_at: Timestamp,
+    pub activate_at: Timestamp,
+    pub retire_at: Option<Timestamp>,
+    pub removed_at: Option<Timestamp>,
+}
+
+/// A seed out of the store: `None` if it would not open.
+pub type OpenedSeed = Option<zeroize::Zeroizing<[u8; 32]>>;
+
+fn signing_key_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(SigningKeyRow, Vec<u8>)> {
+    let public: Vec<u8> = r.get(1)?;
+    let public_key = <[u8; 32]>::try_from(public.as_slice()).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Blob,
+            format!(
+                "signing_key.public_key is {} bytes; 32 required",
+                public.len()
+            )
+            .into(),
+        )
+    })?;
+    Ok((
+        SigningKeyRow {
+            kid: r.get(0)?,
+            public_key,
+            created_at: Timestamp(r.get(3)?),
+            activate_at: Timestamp(r.get(4)?),
+            retire_at: r.get::<_, Option<i64>>(5)?.map(Timestamp),
+            removed_at: r.get::<_, Option<i64>>(6)?.map(Timestamp),
+        },
+        r.get(2)?,
+    ))
+}
+
+const SIGNING_KEY_COLUMNS: &str =
+    "kid, public_key, seed_sealed, created_at, activate_at, retire_at, removed_at";
+
+/// Newest first. `rowid` breaks a tie between two keys with the same second on
+/// both clocks, which an immediate rotation right after boot produces.
+const SIGNING_KEY_ORDER: &str = "ORDER BY activate_at DESC, created_at DESC, rowid DESC";
+
+pub fn insert_signing_key(
+    conn: &Connection,
+    key: &NewSigningKey,
+    now: Timestamp,
+    activate_at: Timestamp,
+) -> Result<(), RepoError> {
+    conn.execute(
+        "INSERT INTO signing_key (kid, public_key, seed_sealed, created_at, activate_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            key.kid,
+            key.public_key.as_slice(),
+            seal(key.seed.as_slice(), &signing_seed_context(&key.kid)),
+            now.secs(),
+            activate_at.secs(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Add `key` and give every key before it an end date no later than
+/// `retire_at`.
+///
+/// The predicate has two halves and both matter. `retire_at IS NULL` dates the
+/// keys nothing has superseded yet. `retire_at > ?1` pulls an EARLIER date onto
+/// a key that already had a later one — which is what an immediate rotation
+/// needs: a key that a previous, leisurely rotation left published for another
+/// day must stop being published now. A key already dated at or before
+/// `retire_at` keeps its date, so rotating can shorten how long an old key
+/// stays published and can never extend it. After this exactly one key — the
+/// new one — is open-ended.
+pub fn rotate_signing_key(
+    conn: &Connection,
+    key: &NewSigningKey,
+    now: Timestamp,
+    activate_at: Timestamp,
+    retire_at: Timestamp,
+) -> Result<(), RepoError> {
+    conn.execute(
+        "UPDATE signing_key SET retire_at = ?1
+         WHERE removed_at IS NULL AND (retire_at IS NULL OR retire_at > ?1)",
+        params![retire_at.secs()],
+    )?;
+    insert_signing_key(conn, key, now, activate_at)
+}
+
+/// Every key ever created, removed ones included, newest first.
+pub fn list_signing_keys(conn: &Connection) -> Result<Vec<SigningKeyRow>, RepoError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SIGNING_KEY_COLUMNS} FROM signing_key {SIGNING_KEY_ORDER}"
+    ))?;
+    let rows = stmt.query_map([], |r| signing_key_row(r).map(|(row, _)| row))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(RepoError::from)
+}
+
+/// The keys the issuer holds in memory: everything not yet removed, newest
+/// first, each with its seed opened.
+///
+/// A seed that will not open is returned as `None` rather than failing the
+/// load. Its public half is still worth publishing — tokens it signed before
+/// the keyfile was lost go on verifying — and one unreadable row must not take
+/// the readable ones down with it.
+pub fn load_signing_keys(conn: &Connection) -> Result<Vec<(SigningKeyRow, OpenedSeed)>, RepoError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SIGNING_KEY_COLUMNS} FROM signing_key WHERE removed_at IS NULL {SIGNING_KEY_ORDER}"
+    ))?;
+    let rows = stmt
+        .query_map([], signing_key_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(row, sealed)| {
+            let seed = open(&sealed, &signing_seed_context(&row.kid))
+                .ok()
+                .and_then(|mut plain| {
+                    let seed = <[u8; 32]>::try_from(plain.as_slice()).ok();
+                    zeroize::Zeroize::zeroize(&mut plain);
+                    seed.map(zeroize::Zeroizing::new)
+                });
+            (row, seed)
+        })
+        .collect())
+}
+
+/// Keys past their `retire_at` that the prune has not removed yet.
+pub fn retired_signing_keys_due(
+    conn: &Connection,
+    now: Timestamp,
+) -> Result<Vec<String>, RepoError> {
+    let mut stmt = conn.prepare(
+        "SELECT kid FROM signing_key
+         WHERE removed_at IS NULL AND retire_at IS NOT NULL AND retire_at <= ?1",
+    )?;
+    let rows = stmt.query_map(params![now.secs()], |r| r.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(RepoError::from)
+}
+
+/// Mark one retired key removed. Returns false if it was not there, was already
+/// removed, or is not past `retire_at` — the predicate is repeated here rather
+/// than trusted from the caller's earlier read, because removing a key that is
+/// still published breaks every verifier holding a token it signed.
+pub fn remove_retired_signing_key(
+    conn: &Connection,
+    kid: &str,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "UPDATE signing_key SET removed_at = ?1
+         WHERE kid = ?2 AND removed_at IS NULL AND retire_at IS NOT NULL AND retire_at <= ?1",
+        params![now.secs(), kid],
+    )?;
+    Ok(changed > 0)
+}
+
+/// The signing-key half of [`reseal_all`]. Removed keys are resealed too: their
+/// rows are kept, so their seeds must not be what pins an old custody key.
+pub(crate) fn reseal_signing_keys_with(
+    conn: &Connection,
+    ring: &KeyRing,
+) -> Result<ResealReport, RepoError> {
+    let active = ring.active_id();
+    let mut report = ResealReport::default();
+    let mut stmt = conn.prepare("SELECT kid, seed_sealed FROM signing_key")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (kid, sealed) in rows {
+        if key_id_of(&sealed) == Some(active) {
+            report.current += 1;
+            continue;
+        }
+        let ctx = signing_seed_context(&kid);
+        match ring.open(&sealed, &ctx) {
+            Ok(mut seed) => {
+                conn.execute(
+                    "UPDATE signing_key SET seed_sealed = ?1 WHERE kid = ?2",
+                    params![ring.seal(&seed, &ctx), kid],
+                )?;
+                zeroize::Zeroize::zeroize(&mut seed);
+                report.resealed += 1;
+            }
+            Err(_) => report.failed += 1,
+        }
+    }
+    Ok(report)
 }
 
 /// One custody's scheduling state, without its secrets.
@@ -1143,6 +1396,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept, vec![1, 1, 255, 255]);
+    }
+
+    /// The boot `Reseal` must reach `signing_key.seed_sealed` as well as the
+    /// custody columns. Driven through `reseal_all_with` — the function the
+    /// writer's `Reseal` runs, with the ring swapped — so a table left out of
+    /// it fails here.
+    #[test]
+    fn reseal_moves_a_signing_seed_onto_a_rotated_custody_key() {
+        let conn = store::open_in_memory().unwrap();
+        let now = Timestamp(1_700_000_000);
+        let key = crate::issuer::keys::generate();
+        let seed = *key.seed;
+        insert_signing_key(&conn, &key, now, now).unwrap();
+        insert_custody(&conn, &custody_row("cust-1", now)).unwrap();
+        let sealed = |conn: &Connection| -> Vec<u8> {
+            conn.query_row("SELECT seed_sealed FROM signing_key", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = sealed(&conn);
+        assert_eq!(key_id_of(&before), Some(1));
+
+        let rotated = crate::store::crypto::rotated_for_test();
+        let report = reseal_all_with(&conn, &rotated).unwrap();
+        assert_eq!(report.signing_keys.resealed, 1);
+        assert_eq!(report.custody.resealed, 1);
+
+        let after = sealed(&conn);
+        assert_eq!(key_id_of(&after), Some(rotated.active_id()));
+        assert_ne!(after, before);
+        // Same seed, same row binding, now under the new key.
+        assert_eq!(
+            rotated
+                .open(&after, &signing_seed_context(&key.kid))
+                .unwrap(),
+            seed
+        );
+        assert!(rotated
+            .open(&after, &signing_seed_context("other"))
+            .is_err());
+
+        let again = reseal_all_with(&conn, &rotated).unwrap();
+        assert_eq!(
+            (again.signing_keys.resealed, again.signing_keys.current),
+            (0, 1),
+            "a second pass is a no-op"
+        );
+
+        // A seed that cannot be opened is counted and left as it was.
+        conn.execute("UPDATE signing_key SET seed_sealed = x'0101ffff'", [])
+            .unwrap();
+        let failed = reseal_all_with(&conn, &rotated).unwrap();
+        assert_eq!(failed.signing_keys.failed, 1);
+        assert_eq!(sealed(&conn), vec![1, 1, 255, 255]);
+        // And the issuer's load reports it as unusable instead of failing.
+        let loaded = load_signing_keys(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].1.is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Current State
 
-_Last updated: 2026-10-03_
+_Last updated: 2026-10-11_
 
 ## Status
 
@@ -395,6 +395,41 @@ open — delete development databases. The keyfile format is backward compatible
 | `rotate-key` + restart | ✅ `resealed=1`; raw column header `01 02`; same `/internal/token` access token still served |
 
 189 crate tests, clippy clean under `-D warnings`.
+
+## Added since (2026-10-11) — token issuer, slice S1: signing core and schema v5
+
+First of seven slices (`docs/design/token-issuer-scope.md` is the scope;
+`token-issuer.md` the fuller design it overrides). Nothing issues a token yet:
+this slice is the keys and the signer.
+
+- **Schema v5**, one migration: `tenant` (a `default` row pre-seeded),
+  `principal`, `principal_secret`, `user_grant`, `signing_key`. Only
+  `signing_key` has code behind it so far.
+- **`issuer/`**: Ed25519 keys in the store, seed sealed under the custody
+  keyring (AAD `signing:<kid>:seed`); a compact-JWS signer (`alg=EdDSA`,
+  `typ=JWT`); an in-memory key cache that re-reads the store every 60 s.
+  `kid` = base64url(SHA-256(public key)[..8]).
+- **No state column.** Pending / signing / published are derived from
+  `activate_at` / `retire_at` / `removed_at` against the clock.
+- **First boot creates one key** with a Tier A `signing_key.created` row, whether
+  or not the issuer is configured (config arrives in S3).
+- **Rotation is an operation**: `POST /admin/signing-keys/rotate`
+  (`{"activate_in_secs": N}`, default a day) and
+  `session-broker rotate-signing-key [--now]`. Zero lead = emergency: the new key
+  signs now and every older key is unpublished now.
+- **Prune** rides the hourly audit-prune timer and marks keys past `retire_at`
+  removed (`signing_key.removed`). It runs even with `audit_retention_days = 0`.
+- **Boot `Reseal` now covers `signing_key.seed_sealed`** as well as custody.
+- `ed25519-dalek` is a direct dependency (it was already in the graph);
+  `jsonwebtoken` is a dev-dependency of the broker, so tokens are verified in
+  tests by code that shares nothing with the encoder.
+
+**One bug found by running it, not by the tests:** after a rotation with a lead,
+an emergency rotation left the original key published for two more days — the
+UPDATE only dated keys with `retire_at IS NULL`. It now also pulls an earlier
+date onto keys dated later, with a regression test.
+
+206 crate tests (was 189), clippy clean under `-D warnings`.
 
 ## Known gaps that remain
 

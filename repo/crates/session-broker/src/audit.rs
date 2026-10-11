@@ -48,6 +48,9 @@ pub mod action {
     pub const KEY_REVOKED: &str = "key.revoked";
     pub const SESSION_REVOKED: &str = "session.revoked";
     pub const LOGGING_LEVEL_CHANGED: &str = "logging.level_changed";
+    pub const SIGNING_KEY_CREATED: &str = "signing_key.created";
+    pub const SIGNING_KEY_ROTATED: &str = "signing_key.rotated";
+    pub const SIGNING_KEY_REMOVED: &str = "signing_key.removed";
 
     // Tier B — batched, fail-open.
     pub const SESSION_CREATED: &str = "session.created";

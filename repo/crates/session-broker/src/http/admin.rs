@@ -58,6 +58,9 @@ pub struct AdminState {
     pub metrics: Arc<Metrics>,
     /// Limits WRONG-key attempts (M6). `None` in tests.
     pub rate_limit: Option<crate::http::guards::RateLimit>,
+    /// The token issuer's signing keys. `None` when they could not be loaded
+    /// at boot, and in tests that do not exercise them.
+    pub issuer: Option<Arc<crate::issuer::Issuer>>,
 }
 
 /// The admin actor for an audited row.
@@ -85,6 +88,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/sessions", get(list_sessions))
         .route("/admin/sessions/{sid}", delete(revoke_session))
         .route("/admin/custody", get(list_custody))
+        .route(
+            "/admin/signing-keys/rotate",
+            axum::routing::post(rotate_signing_key),
+        )
         .route("/admin/audit", get(list_audit))
         .route(
             "/admin/observability",
@@ -873,6 +880,97 @@ async fn list_custody(
     }
 }
 
+// --- signing keys -------------------------------------------------------
+
+/// Longest publish lead a rotation may ask for. A key scheduled further out
+/// than this is a typo, not a plan.
+const MAX_ROTATE_LEAD_SECS: u64 = 30 * 86_400;
+
+#[derive(Debug, Default, Deserialize)]
+struct RotateSigningKeyRequest {
+    /// Seconds until the new key starts signing. Absent: the default publish
+    /// lead (a day). `0`: now, and every older key is unpublished now.
+    activate_in_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct RotateSigningKeyResponse {
+    #[serde(flatten)]
+    rotation: crate::issuer::Rotation,
+    /// What an operator should expect to happen next, in words.
+    note: &'static str,
+}
+
+/// `POST /admin/signing-keys/rotate`. The body is optional.
+async fn rotate_signing_key(
+    State(state): State<AdminState>,
+    crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
+        return *response;
+    }
+    let Some(issuer) = &state.issuer else {
+        return refuse(
+            StatusCode::NOT_IMPLEMENTED,
+            "lane_disabled",
+            "The signing keys could not be loaded at start, so they cannot be rotated here.",
+        );
+    };
+    let request: RotateSigningKeyRequest =
+        if body.iter().all(u8::is_ascii_whitespace) {
+            RotateSigningKeyRequest::default()
+        } else {
+            match serde_json::from_slice(&body) {
+                Ok(request) => request,
+                Err(_) => return refuse(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "The body must be empty or a JSON object with an optional activate_in_secs.",
+                ),
+            }
+        };
+    if request
+        .activate_in_secs
+        .is_some_and(|secs| secs > MAX_ROTATE_LEAD_SECS)
+    {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "activate_in_out_of_range",
+            "activate_in_secs must be at most 2592000 (30 days).",
+        );
+    }
+
+    // The Tier A row (`signing_key.rotated`) rides the same transaction inside
+    // `Issuer::rotate`, so a store failure refuses the rotation outright.
+    match issuer.rotate(request.activate_in_secs, ADMIN_ACTOR) {
+        Ok(rotation) => {
+            let note = if rotation.immediate {
+                "The new key signs now and every older key is no longer published. Tokens \
+                 issued before this are invalid, and verifiers reject new tokens until they \
+                 next refresh their key set."
+            } else {
+                "The new key is published now and starts signing at activate_at. Older keys \
+                 stay published until previous_retire_at."
+            };
+            (
+                StatusCode::CREATED,
+                Json(RotateSigningKeyResponse { rotation, note }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "admin: rotating the signing key failed");
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_error",
+                "The new key could not be stored, so nothing was rotated.",
+            )
+        }
+    }
+}
+
 // --- helpers ------------------------------------------------------------
 
 pub(crate) fn hash_secret(secret: &str) -> Vec<u8> {
@@ -939,6 +1037,7 @@ mod tests {
                 metrics,
                 lane: "admin",
             }),
+            issuer: None,
         };
         (router(state), writer)
     }
@@ -1062,6 +1161,7 @@ mod tests {
             log: None,
             metrics,
             rate_limit: None,
+            issuer: None,
         };
         (router(state), writer)
     }
@@ -1173,6 +1273,7 @@ mod tests {
             ("GET", "/admin/api-keys"),
             ("GET", "/admin/sessions"),
             ("GET", "/admin/custody"),
+            ("POST", "/admin/signing-keys/rotate"),
         ] {
             let response = router
                 .clone()
@@ -1198,6 +1299,173 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The admin lane with the signing keys behind it, as `main` builds it:
+    /// bootstrapped, so one key already exists. Returns the database path so a
+    /// test can look at the rows through a connection of its own.
+    fn issuer_harness() -> (Router, Writer, std::path::PathBuf) {
+        let path = temp_db().with_extension("issuer.sqlite3");
+        let _ = std::fs::remove_file(&path);
+        let keyfile = path.with_extension("key");
+        let conn = crate::store::open(&path, &keyfile).unwrap();
+        let reader = Arc::new(Reader::new(crate::store::open(&path, &keyfile).unwrap()));
+        let writer = Writer::spawn(conn);
+        let metrics = crate::telemetry::Metrics::new();
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let audit = crate::audit::AuditSink::new(
+            writer.handle(),
+            metrics.clone(),
+            crate::audit::AuditConfig::default(),
+        );
+        let issuer = crate::issuer::bootstrap(
+            reader.clone(),
+            writer.handle(),
+            Some(audit.clone()),
+            clock.clone(),
+            crate::issuer::KeyPolicy::default(),
+        )
+        .unwrap();
+        let state = AdminState {
+            sessions: Arc::new(SessionMap::new(SessionPolicy::default())),
+            reader,
+            writer: writer.handle(),
+            clock,
+            admin_key: Some(Arc::from(ADMIN_KEY)),
+            audit: Some(audit),
+            log: None,
+            metrics,
+            rate_limit: None,
+            issuer: Some(issuer),
+        };
+        (router(state), writer, path)
+    }
+
+    fn signing_keys(path: &std::path::Path) -> Vec<repo::SigningKeyRow> {
+        let conn = crate::store::open(path, &path.with_extension("key")).unwrap();
+        repo::list_signing_keys(&conn).unwrap()
+    }
+
+    fn audit_actions(path: &std::path::Path, action: &str) -> Vec<repo::StoredAuditRow> {
+        let conn = crate::store::open(path, &path.with_extension("key")).unwrap();
+        repo::list_audit(
+            &conn,
+            &repo::AuditQuery {
+                limit: 100,
+                ..repo::AuditQuery::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.row.action == action)
+        .collect()
+    }
+
+    /// The route is the admin lane's one sender of `RotateSigningKey`. Observed
+    /// through a separate connection: the new key is there, pending, the old
+    /// one has an end date, and the record of it committed too.
+    #[tokio::test]
+    async fn rotating_over_the_admin_lane_stores_a_pending_key_and_records_it() {
+        let (router, _w, path) = issuer_harness();
+        let first = signing_keys(&path);
+        assert_eq!(first.len(), 1);
+
+        // No body at all: the default lead of a day.
+        let response = router
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/admin/signing-keys/rotate",
+                Some(ADMIN_KEY),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = json(response).await;
+        assert_eq!(body["activate_at"], T0.secs() + 86_400);
+        assert_eq!(
+            body["previous_retire_at"],
+            T0.secs() + 86_400 + 86_400 + 300
+        );
+        assert_eq!(body["immediate"], false);
+
+        let keys = signing_keys(&path);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].kid, body["kid"].as_str().unwrap());
+        assert_eq!(keys[0].activate_at, T0.plus_secs(86_400));
+        assert_eq!(keys[0].retire_at, None);
+        assert_eq!(keys[1].kid, first[0].kid);
+        assert_eq!(keys[1].retire_at, Some(T0.plus_secs(2 * 86_400 + 300)));
+
+        let recorded = audit_actions(&path, crate::audit::action::SIGNING_KEY_ROTATED);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].row.key_id.as_deref(),
+            Some(keys[0].kid.as_str())
+        );
+        assert_eq!(recorded[0].row.actor_id.as_deref(), Some(ADMIN_ACTOR));
+
+        // An explicit zero is the emergency form.
+        let response = router
+            .oneshot(req(
+                "POST",
+                "/admin/signing-keys/rotate",
+                Some(ADMIN_KEY),
+                Some(r#"{"activate_in_secs":0}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = json(response).await;
+        assert_eq!(body["immediate"], true);
+        assert_eq!(body["activate_at"], T0.secs());
+        assert_eq!(signing_keys(&path).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_rotation_request_that_makes_no_sense_changes_nothing() {
+        let (router, _w, path) = issuer_harness();
+        for body in [r#"{"activate_in_secs":2592001}"#, "not json"] {
+            let response = router
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/admin/signing-keys/rotate",
+                    Some(ADMIN_KEY),
+                    Some(body),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        // And neither the admin key's absence nor a backend key gets through.
+        for key in [None, Some("some-backend-key")] {
+            let response = router
+                .clone()
+                .oneshot(req("POST", "/admin/signing-keys/rotate", key, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(signing_keys(&path).len(), 1);
+        assert!(audit_actions(&path, crate::audit::action::SIGNING_KEY_ROTATED).is_empty());
+    }
+
+    /// Without the keys loaded the route says so; it does not pretend to rotate.
+    #[tokio::test]
+    async fn rotation_without_an_issuer_is_refused_as_disabled() {
+        let (router, _w) = harness(Some(ADMIN_KEY));
+        let response = router
+            .oneshot(req(
+                "POST",
+                "/admin/signing-keys/rotate",
+                Some(ADMIN_KEY),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     /// Unconfigured means off, not open.

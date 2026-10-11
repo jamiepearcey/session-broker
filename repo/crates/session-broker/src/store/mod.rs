@@ -24,7 +24,7 @@ pub mod writer;
 
 /// Schema version this binary knows how to reach. Bump this and append to
 /// [`MIGRATIONS`] together — the two must stay the same length.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Forward-only migration steps, applied in order inside one transaction at
 /// boot. `store::migrate` tracks how far a given database file has already
@@ -138,6 +138,74 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE session ADD COLUMN tombstoned_at INTEGER;
     CREATE INDEX session_dead ON session(tombstoned_at) WHERE status = 'tombstoned';
+    "#,
+    // v5 — the token issuer's data (docs/design/token-issuer.md §2, §4). All
+    // five tables in one step so the slices that follow add code, not schema.
+    //
+    // New tables rather than columns on `api_key`: an `api_key` row can act as
+    // ANY user on `/internal/token`, and a service principal must never be
+    // resolvable there.
+    //
+    // `tenant` is pre-seeded with `default` so a self-hosted deployment needs
+    // no tenant configuration at all.
+    //
+    // `signing_key` has no state column, deliberately. Pending, active and
+    // retired are derived from `activate_at` / `retire_at` / `removed_at`
+    // against the clock, so there is no state for somebody to forget to
+    // transition. `seed_sealed` is the Ed25519 seed under the custody keyring;
+    // `public_key` is public and stored in the clear.
+    r#"
+    CREATE TABLE tenant (
+      tenant_id    TEXT PRIMARY KEY,
+      display_name TEXT,
+      created_at   INTEGER NOT NULL,
+      disabled_at  INTEGER                -- NULL means enabled
+    );
+    INSERT INTO tenant (tenant_id, display_name, created_at, disabled_at)
+      VALUES ('default', 'default', strftime('%s','now'), NULL);
+    CREATE TABLE principal (
+      principal_id TEXT PRIMARY KEY,
+      tenant_id    TEXT NOT NULL REFERENCES tenant(tenant_id),
+      name         TEXT NOT NULL,
+      kind         TEXT NOT NULL CHECK (kind IN ('ingest','node','replica','reader','admin')),
+      scope        TEXT NOT NULL,
+      indexes      TEXT NOT NULL,         -- JSON array, or '*'
+      audience     TEXT NOT NULL,
+      max_ttl_secs INTEGER NOT NULL,
+      created_at   INTEGER NOT NULL,
+      created_by   TEXT,
+      last_used_at INTEGER,
+      revoked_at   INTEGER,               -- NULL means live
+      UNIQUE (tenant_id, name)
+    );
+    CREATE TABLE principal_secret (
+      secret_id    TEXT PRIMARY KEY,
+      principal_id TEXT NOT NULL REFERENCES principal(principal_id),
+      secret_hash  BLOB NOT NULL UNIQUE,  -- sha256(secret); the secret is never stored
+      created_at   INTEGER NOT NULL,
+      expires_at   INTEGER,               -- NULL means it does not expire
+      revoked_at   INTEGER
+    );
+    CREATE INDEX principal_secret_live ON principal_secret(secret_hash) WHERE revoked_at IS NULL;
+    CREATE TABLE user_grant (
+      sub        TEXT NOT NULL,
+      tenant_id  TEXT NOT NULL REFERENCES tenant(tenant_id),
+      roles      TEXT NOT NULL,           -- JSON array
+      indexes    TEXT NOT NULL,           -- JSON array, or '*'
+      created_at INTEGER NOT NULL,
+      created_by TEXT,
+      revoked_at INTEGER,
+      PRIMARY KEY (sub, tenant_id)
+    );
+    CREATE TABLE signing_key (
+      kid         TEXT PRIMARY KEY,       -- base64url(sha256(public_key)[..8])
+      public_key  BLOB NOT NULL,
+      seed_sealed BLOB NOT NULL,          -- sealed, context `signing:<kid>:seed`
+      created_at  INTEGER NOT NULL,
+      activate_at INTEGER NOT NULL,       -- signs from here on
+      retire_at   INTEGER,                -- published until here; NULL = open
+      removed_at  INTEGER                 -- set by the prune once past retire_at
+    );
     "#,
 ];
 
@@ -323,6 +391,11 @@ mod tests {
             "txn",
             "api_key",
             "audit",
+            "tenant",
+            "principal",
+            "principal_secret",
+            "user_grant",
+            "signing_key",
             "schema_version",
         ] {
             let count: i64 = conn
@@ -334,5 +407,20 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "missing table {table}");
         }
+    }
+
+    /// Self-host is zero-config: the tenant every principal and grant can
+    /// reference exists from the first boot.
+    #[test]
+    fn v5_seeds_exactly_one_default_tenant() {
+        let conn = open_in_memory().unwrap();
+        let tenants: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT tenant_id, disabled_at FROM tenant")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(tenants, vec![("default".to_owned(), None)]);
     }
 }
