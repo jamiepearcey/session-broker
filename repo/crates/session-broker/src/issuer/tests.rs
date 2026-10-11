@@ -137,10 +137,13 @@ fn verify(
 fn a_signed_token_verifies_with_an_independent_decoder() {
     let s = store("verify");
     let issuer = s.boot();
-    let token = issuer.sign(&claims()).unwrap();
+    // Built once: `claims()` reads the wall clock, and two calls can straddle
+    // a second.
+    let claims = claims();
+    let token = issuer.sign(&claims).unwrap();
 
     let decoded = verify(&issuer, &token).expect("an independent decoder accepts the token");
-    assert_eq!(decoded.claims, claims());
+    assert_eq!(decoded.claims, claims);
     assert_eq!(decoded.header.alg, jsonwebtoken::Algorithm::EdDSA);
     assert_eq!(decoded.header.typ.as_deref(), Some("JWT"));
     assert_eq!(decoded.header.kid, issuer.signing_kid());
@@ -149,7 +152,7 @@ fn a_signed_token_verifies_with_an_independent_decoder() {
     // so the acceptance above is a signature check and not a parse.
     let mut parts: Vec<&str> = token.split('.').collect();
     assert_eq!(parts.len(), 3);
-    let mut altered = claims();
+    let mut altered = claims.clone();
     altered["tenant"] = "someone-else".into();
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&altered).unwrap());
     parts[1] = &payload;

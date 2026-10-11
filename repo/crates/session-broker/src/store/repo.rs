@@ -983,6 +983,21 @@ pub fn find_live_principal_by_secret(
     .transpose()
 }
 
+/// Record that a principal was issued a token. Deliberately unconditional: it
+/// is sent only after the secret resolved, and a principal revoked a moment
+/// later still shows when it was last used.
+pub fn touch_principal(
+    conn: &Connection,
+    principal_id: &str,
+    now: Timestamp,
+) -> Result<(), RepoError> {
+    conn.execute(
+        "UPDATE principal SET last_used_at = ?1 WHERE principal_id = ?2",
+        params![now.secs(), principal_id],
+    )?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct NewUserGrant {
     pub sub: String,

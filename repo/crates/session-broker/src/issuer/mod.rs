@@ -27,7 +27,8 @@
 pub mod jwt;
 pub mod keys;
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -45,6 +46,11 @@ use keys::KeyCache;
 /// store. This is what lets `session-broker rotate-signing-key`, a separate
 /// process, take effect on a running broker without a signal or a restart.
 const RELOAD_INTERVAL_SECS: u64 = 60;
+
+/// How often a principal's `last_used_at` is refreshed. It answers "is anything
+/// still using this?" before an operator revokes, and a minute is fine-grained
+/// enough for that without a store write per token.
+const TOUCH_INTERVAL_SECS: u64 = 60;
 
 /// Added to the longest token lifetime when dating a superseded key, to cover
 /// the clock allowance verifiers apply to `exp`.
@@ -103,6 +109,11 @@ pub struct Rotation {
 pub struct IssuerHandle {
     pub signer: Arc<Issuer>,
     pub config: Arc<crate::config::IssuerConfig>,
+    /// Counts wrong credentials on `/auth/token`, one bucket per `client_id`.
+    /// Keyed on what the caller claims to be rather than where it connects
+    /// from, so it works with no client-IP header configured. `None` when rate
+    /// limiting is off.
+    pub client_failures: Option<Arc<crate::ratelimit::Limiter>>,
 }
 
 pub struct Issuer {
@@ -114,6 +125,9 @@ pub struct Issuer {
     clock: Arc<dyn Clock>,
     policy: KeyPolicy,
     cache: RwLock<KeyCache>,
+    /// When each principal's `last_used_at` was last written. See
+    /// [`Issuer::record_use`].
+    touched: Mutex<HashMap<String, Timestamp>>,
 }
 
 impl std::fmt::Debug for Issuer {
@@ -177,6 +191,7 @@ impl Issuer {
             clock,
             policy,
             cache: RwLock::new(KeyCache::default()),
+            touched: Mutex::new(HashMap::new()),
         };
         issuer.reload()?;
         Ok(Arc::new(issuer))
@@ -224,10 +239,43 @@ impl Issuer {
     /// The claims are the caller's. This adds only the header
     /// (`alg=EdDSA`, `typ=JWT`, `kid`).
     pub fn sign<C: Serialize>(&self, claims: &C) -> Result<String, IssuerError> {
+        self.sign_with_kid(claims).map(|(_, token)| token)
+    }
+
+    /// [`Issuer::sign`], also naming the key that signed, for the audit row.
+    pub fn sign_with_kid<C: Serialize>(&self, claims: &C) -> Result<(String, String), IssuerError> {
         self.with_keys(|keys, now| {
             let (kid, key) = keys.signing(now).ok_or(IssuerError::NoSigningKey)?;
-            Ok(jwt::encode(kid, key, claims)?)
+            Ok((kid.to_owned(), jwt::encode(kid, key, claims)?))
         })
+    }
+
+    /// The principal a presented secret authenticates right now, if any.
+    ///
+    /// `None` covers every way a secret stops working (unknown, revoked,
+    /// expired, principal revoked, tenant disabled) without saying which.
+    pub fn authenticate(&self, secret: &str) -> Result<Option<repo::PrincipalRow>, IssuerError> {
+        let hash = crate::http::admin::hash_secret(secret);
+        let now = self.clock.now();
+        self.reader
+            .with(|conn| repo::find_live_principal_by_secret(conn, &hash, now))
+            .map_err(|e| IssuerError::Store(e.to_string()))
+    }
+
+    /// Record that a principal was issued a token, at most once per
+    /// [`TOUCH_INTERVAL_SECS`]. Write-behind: issuance never waits on it.
+    pub fn record_use(&self, principal_id: &str) {
+        let now = self.clock.now();
+        {
+            let Ok(mut touched) = self.touched.lock() else {
+                return;
+            };
+            match touched.get(principal_id) {
+                Some(at) if now.since(*at) < TOUCH_INTERVAL_SECS => return,
+                _ => touched.insert(principal_id.to_owned(), now),
+            };
+        }
+        let _ = self.writer.enqueue_principal_touch(principal_id, now);
     }
 
     /// The `kid` tokens are being signed with right now.

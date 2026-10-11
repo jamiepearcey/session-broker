@@ -119,6 +119,8 @@ pub struct IssuerConfig {
     pub jwks_max_age_secs: u64,
     /// Where the key set is served: `base_url` + `/auth/jwks.json`.
     pub jwks_uri: String,
+    /// Where machine tokens are issued: `base_url` + `/auth/token`.
+    pub token_endpoint: String,
 }
 
 impl IssuerConfig {
@@ -638,6 +640,7 @@ fn issuer_config(sources: &Sources, base_url: &str) -> Result<Option<IssuerConfi
         publish_lead_secs,
         jwks_max_age_secs,
         jwks_uri: format!("{base}/auth/jwks.json"),
+        token_endpoint: format!("{base}/auth/token"),
     }))
 }
 

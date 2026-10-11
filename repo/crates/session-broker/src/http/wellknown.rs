@@ -36,10 +36,13 @@ pub async fn metadata(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let Some(handle) = &state.issuer else {
         return lane_disabled();
     };
-    // Only what exists. The token endpoint is advertised by the slice that adds it.
+    // Only what exists.
     let doc = serde_json::json!({
         "issuer": handle.config.issuer,
         "jwks_uri": handle.config.jwks_uri,
+        "token_endpoint": handle.config.token_endpoint,
+        "grant_types_supported": ["client_credentials"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
         "response_types_supported": ["token"],
     });
     document(&state, handle, &headers, &doc)

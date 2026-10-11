@@ -66,6 +66,8 @@ pub mod action {
     pub const LOGIN_FAILED: &str = "login.failed";
     pub const TOKEN_EXCHANGED: &str = "token.exchanged";
     pub const TOKEN_REFUSED: &str = "token.refused";
+    pub const TOKEN_ISSUED: &str = "token.issued";
+    pub const TOKEN_ISSUANCE_REFUSED: &str = "token.issuance_refused";
     pub const CUSTODY_DEGRADED: &str = "custody.degraded";
     pub const CUSTODY_DEAD: &str = "custody.dead";
     pub const CUSTODY_REVOKED_UPSTREAM: &str = "custody.revoked_upstream";
@@ -278,9 +280,10 @@ struct Inner {
     depth: Arc<AtomicI64>,
     /// Dropped since the last `audit.gap` row was emitted.
     pending_gap: AtomicU64,
-    /// `(key_id, sid) -> last recorded`. Bounded by eviction on write; see
-    /// [`Inner::should_record_exchange`].
-    exchange_seen: Mutex<HashMap<(String, String), i64>>,
+    /// `(action, who, for what) -> last recorded`: `(key_id, sid)` for
+    /// `token.exchanged`, `(principal or sub, audience)` for `token.issued`.
+    /// Bounded by eviction on write; see [`AuditSink::should_record_exchange`].
+    exchange_seen: Mutex<HashMap<(&'static str, String, String), i64>>,
 }
 
 /// Upper bound on the coalescing map. Past this it is cleared wholesale rather
@@ -385,6 +388,16 @@ impl AuditSink {
     /// afternoon", not the ten thousand times it did so. Refusals never come
     /// here — a refusal is always interesting.
     pub fn should_record_exchange(&self, key_id: &str, sid: &str, now: Timestamp) -> bool {
+        self.should_record(action::TOKEN_EXCHANGED, key_id, sid, now)
+    }
+
+    /// The same question for `token.issued`: one row per `(actor, audience)`
+    /// per window. `actor_id` is the principal id, or the `sub` of a user.
+    pub fn should_record_issuance(&self, actor_id: &str, audience: &str, now: Timestamp) -> bool {
+        self.should_record(action::TOKEN_ISSUED, actor_id, audience, now)
+    }
+
+    fn should_record(&self, action: &'static str, who: &str, what: &str, now: Timestamp) -> bool {
         let window = self.inner.config.coalesce_secs as i64;
         if window <= 0 {
             return true;
@@ -395,7 +408,7 @@ impl AuditSink {
             // an extra row is strictly safer than skipping one.
             Err(_) => return true,
         };
-        let key = (key_id.to_owned(), sid.to_owned());
+        let key = (action, who.to_owned(), what.to_owned());
         if let Some(last) = seen.get(&key) {
             if now.secs() - *last < window {
                 return false;

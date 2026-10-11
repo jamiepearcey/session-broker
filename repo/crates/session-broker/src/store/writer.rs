@@ -139,6 +139,12 @@ pub enum AdminWrite {
         principal_id: String,
         now: Timestamp,
     },
+    /// `last_used_at`, sent by the token lane at most once a minute per
+    /// principal.
+    TouchPrincipal {
+        principal_id: String,
+        now: Timestamp,
+    },
     /// A further secret. `expire_others_at` dates the principal's older live
     /// secrets; `None` leaves them valid until somebody revokes them.
     AddPrincipalSecret {
@@ -344,6 +350,26 @@ impl WriterHandle {
                 // Recording "a key was used" is what `last_used_at` is for; an
                 // audit row per use would be the coalescing problem ADR-0015
                 // solves for token exchange, without the audit value.
+                None,
+                ack_tx,
+            ))
+            .map_err(|_| "writer thread is gone".to_owned())
+    }
+
+    /// Record that a principal was issued a token. Fire-and-forget, for the
+    /// same reason as [`WriterHandle::enqueue_touch`].
+    pub fn enqueue_principal_touch(
+        &self,
+        principal_id: &str,
+        now: Timestamp,
+    ) -> Result<(), String> {
+        let (ack_tx, _ack_rx) = mpsc::channel();
+        self.tx
+            .send(Command::Admin(
+                AdminWrite::TouchPrincipal {
+                    principal_id: principal_id.to_owned(),
+                    now,
+                },
                 None,
                 ack_tx,
             ))
@@ -636,6 +662,9 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                         }
                         AdminWrite::RevokePrincipal { principal_id, now } => {
                             repo::revoke_principal(&tx, &principal_id, now)
+                        }
+                        AdminWrite::TouchPrincipal { principal_id, now } => {
+                            repo::touch_principal(&tx, &principal_id, now).map(|()| true)
                         }
                         AdminWrite::AddPrincipalSecret {
                             principal_id,

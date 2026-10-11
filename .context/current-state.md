@@ -493,6 +493,54 @@ both documents answer `501 lane_disabled`.
 - **Wiring**: `AppState.issuer: Option<IssuerHandle { signer, config }>`;
   `AdminState.issuer` keeps the bare `Arc<Issuer>`.
 
+## Added since (2026-10-11) — token issuer, slice S4: machine tokens
+
+`POST /auth/token` on the public listener: a service principal trades its secret
+for a signed token (OAuth client credentials). `501 lane_disabled` until the
+issuer is configured.
+
+- **Request**: `application/x-www-form-urlencoded` only.
+  `grant_type=client_credentials`, `client_id` (the `sp_` id), `client_secret`
+  (the `sbp_` secret), optional `scope` (space-separated, a subset of the
+  principal's) and optional `ttl` (seconds, at most the principal's
+  `max_ttl_secs` and `issuer_max_ttl_secs`). The id and secret may come in HTTP
+  Basic instead; both at once is `invalid_request`. Unknown fields, `tenant` and
+  `audience` among them, are ignored.
+- **Response**: `{access_token, token_type: "Bearer", expires_in, scope}`,
+  `no-store`. Default lifetime is `issuer_machine_ttl_secs`, lowered to the
+  principal's maximum.
+- **Claims**, all from the principal's row: `iss`, `sub` (principal id), `aud`
+  (one string), `exp`, `iat`, `jti`, `tenant`, `kind`, `name`, `scopes`,
+  `indexes`. Header `alg=EdDSA`, `typ=JWT`, `kid`.
+- **Refusals** are `{error, error_description}`: `invalid_request` 400 (not a
+  form, missing `grant_type`, a parameter sent twice, bad or too-long `ttl`),
+  `unsupported_grant_type` 400, `invalid_client` 401 with `WWW-Authenticate`
+  (one identical body for an unknown id, a wrong, revoked or expired secret, a
+  revoked principal, a disabled tenant), `invalid_scope` 400,
+  `unauthorized_client` 400 (the principal's audience is not in
+  `issuer_audiences`), `rate_limited` 429 with `Retry-After`,
+  `temporarily_unavailable` 503 (store unreadable or no signing key),
+  `lane_disabled` 501.
+- **Rate limit**: wrong credentials only, one bucket per `client_id`
+  (`rate_limit_auth_failure_burst` per `rate_limit_auth_failure_per_secs`, off
+  with `rate_limit_enabled=false`). It does not depend on a client-IP header.
+  The budget is spent after the check, so the holder of the right secret is
+  never locked out by someone guessing against its id. There is no limit on
+  successful issuance.
+- **`last_used_at`** on the principal is written at most once a minute per
+  principal (`AdminWrite::TouchPrincipal`, sent by `Issuer::record_use`).
+- **Audit** (Tier B): `token.issued`, one row per (principal, audience) per
+  `audit_coalesce_secs`, detail `{aud, kind, tenant, kid, jti, ttl}`;
+  `token.issuance_refused`, one row per refusal, reason = the error code. Not
+  recorded: a request that names no credential (counted in the metric only), a
+  429, a 501, a 503.
+- **Metric**: `broker_tokens_issued_total{kind,outcome}`; `kind` is the
+  principal's kind, or `machine` before the caller is identified.
+- **Metadata** now carries `token_endpoint`, `grant_types_supported` and
+  `token_endpoint_auth_methods_supported`.
+- An issued token cannot be revoked. Revoking the principal or the secret stops
+  the next one.
+
 ## Known gaps that remain
 
 - **Postgres/HA backend** (ADR-0005): readiness and drain make ONE node well

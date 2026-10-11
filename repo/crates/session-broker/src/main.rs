@@ -145,6 +145,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(signer) => Some(session_broker::issuer::IssuerHandle {
                 signer,
                 config: Arc::new(cfg.clone()),
+                // Wrong secrets on `/auth/token`, per client id: the same
+                // budget as a wrong backend or admin key.
+                client_failures: config.rate_limit.enabled.then(|| {
+                    Arc::new(session_broker::ratelimit::Limiter::new(
+                        session_broker::ratelimit::Quota::new(
+                            config.rate_limit.auth_failure_burst,
+                            config.rate_limit.auth_failure_per_secs,
+                        ),
+                        config.rate_limit.max_tracked,
+                    ))
+                }),
             }),
             Err(e) => {
                 tracing::error!(error = %e, "signing keys could not be loaded; token issuance is off");

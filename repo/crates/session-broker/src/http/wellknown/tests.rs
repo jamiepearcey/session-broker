@@ -53,6 +53,7 @@ fn issuer_config(max_age: u64) -> IssuerConfig {
         publish_lead_secs: 86_400,
         jwks_max_age_secs: max_age,
         jwks_uri: format!("{ISSUER}/auth/jwks.json"),
+        token_endpoint: format!("{ISSUER}/auth/token"),
     }
 }
 
@@ -97,6 +98,7 @@ fn harness(tag: &str, configured: bool, max_age: u64) -> Harness {
         issuer: issuer.clone().map(|signer| IssuerHandle {
             signer,
             config: Arc::new(issuer_config(max_age)),
+            client_failures: None,
         }),
     };
     Harness {
