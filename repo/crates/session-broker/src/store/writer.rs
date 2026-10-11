@@ -130,6 +130,9 @@ pub enum AdminWrite {
         tenant_id: String,
         now: Timestamp,
     },
+    EnableTenant {
+        tenant_id: String,
+    },
     /// A principal with its first secret, and its tenant if that is new.
     InsertPrincipal {
         principal: repo::NewPrincipal,
@@ -656,6 +659,9 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                         } => repo::insert_tenant(&tx, &tenant_id, display_name.as_deref(), now),
                         AdminWrite::DisableTenant { tenant_id, now } => {
                             repo::disable_tenant(&tx, &tenant_id, now)
+                        }
+                        AdminWrite::EnableTenant { tenant_id } => {
+                            repo::enable_tenant(&tx, &tenant_id)
                         }
                         AdminWrite::InsertPrincipal { principal, now } => {
                             repo::insert_principal(&tx, &principal, now)

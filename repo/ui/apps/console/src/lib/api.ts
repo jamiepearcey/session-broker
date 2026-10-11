@@ -280,6 +280,8 @@ export const adminApi = {
     }),
   disableTenant: (tenant: string) =>
     call<void>(`/tenants/${encodeURIComponent(tenant)}`, { method: "DELETE" }),
+  enableTenant: (tenant: string) =>
+    call<void>(`/tenants/${encodeURIComponent(tenant)}/enable`, { method: "POST" }),
   principals: (tenant?: string) =>
     call<Principal[]>(`/principals${tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""}`),
   principal: (principalId: string) =>

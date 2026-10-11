@@ -493,8 +493,10 @@ pub fn insert_signing_key(
 /// needs: a key that a previous, leisurely rotation left published for another
 /// day must stop being published now. A key already dated at or before
 /// `retire_at` keeps its date, so rotating can shorten how long an old key
-/// stays published and can never extend it. After this exactly one key — the
-/// new one — is open-ended.
+/// stays published and can never extend it. A second statement ends, at `now`,
+/// any key still due to activate after the new one: it has signed nothing, and
+/// left alone it would take signing back from the new key at its own
+/// `activate_at`. After this exactly one key — the new one — is open-ended.
 pub fn rotate_signing_key(
     conn: &Connection,
     key: &NewSigningKey,
@@ -506,6 +508,13 @@ pub fn rotate_signing_key(
         "UPDATE signing_key SET retire_at = ?1
          WHERE removed_at IS NULL AND (retire_at IS NULL OR retire_at > ?1)",
         params![retire_at.secs()],
+    )?;
+    // A key still pending that would activate AFTER the new one has signed
+    // nothing and would take signing back from it. Unpublish it now.
+    conn.execute(
+        "UPDATE signing_key SET retire_at = ?1
+         WHERE removed_at IS NULL AND activate_at > ?2 AND (retire_at IS NULL OR retire_at > ?1)",
+        params![now.secs(), activate_at.secs()],
     )?;
     insert_signing_key(conn, key, now, activate_at)
 }
@@ -672,6 +681,15 @@ pub fn disable_tenant(
     let changed = conn.execute(
         "UPDATE tenant SET disabled_at = ?1 WHERE tenant_id = ?2 AND disabled_at IS NULL",
         params![now.secs(), tenant_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// False if the tenant is unknown or not disabled.
+pub fn enable_tenant(conn: &Connection, tenant_id: &str) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "UPDATE tenant SET disabled_at = NULL WHERE tenant_id = ?1 AND disabled_at IS NOT NULL",
+        params![tenant_id],
     )?;
     Ok(changed > 0)
 }

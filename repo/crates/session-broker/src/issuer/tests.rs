@@ -491,6 +491,73 @@ fn a_second_rotation_does_not_extend_an_already_dated_key() {
     assert_eq!(s.rows().iter().filter(|r| r.retire_at.is_none()).count(), 1);
 }
 
+/// Two overlapping rotations, the second with the shorter lead. The first
+/// one's key is still pending when the second is made; it must not take
+/// signing back from the second when its own `activate_at` arrives, because it
+/// carries an end date and the key the operator meant to be current does not.
+#[test]
+fn a_later_rotation_with_a_shorter_lead_is_not_overtaken_by_the_earlier_one() {
+    let s = store("overlap");
+    let issuer = s.boot();
+    let first = issuer.signing_kid().unwrap();
+    let slow = issuer.rotate(Some(100), "test").unwrap();
+    let fast = issuer.rotate(Some(10), "test").unwrap();
+
+    // The pending key the new one overtakes has signed nothing, so it is
+    // unpublished at once; the active key keeps its grace.
+    let row = |kid: &str| s.rows().into_iter().find(|r| r.kid == kid).unwrap();
+    assert_eq!(row(&slow.kid).retire_at, Some(T0));
+    assert_eq!(row(&fast.kid).retire_at, None);
+    assert_eq!(
+        row(&first).retire_at,
+        Some(T0.plus_secs(10 + DAY + 300)),
+        "pulled onto the sooner rotation's date"
+    );
+    assert_eq!(jwks_kids(&issuer), [fast.kid.as_str(), first.as_str()]);
+
+    s.clock.set(T0.plus_secs(10));
+    assert_eq!(issuer.signing_kid(), Some(fast.kid.clone()));
+    // The slow rotation's `activate_at` arrives: nothing changes hands.
+    s.clock.set(Timestamp(slow.activate_at));
+    assert_eq!(issuer.signing_kid(), Some(fast.kid.clone()));
+    s.clock.set(Timestamp(slow.activate_at + 1));
+    assert_eq!(issuer.signing_kid(), Some(fast.kid.clone()));
+    assert_eq!(jwks_kids(&issuer), [fast.kid.as_str(), first.as_str()]);
+    let token = issuer.sign(&claims()).unwrap();
+    assert_eq!(
+        jsonwebtoken::decode_header(&token).unwrap().kid,
+        Some(fast.kid.clone())
+    );
+    verify(&issuer, &token).unwrap();
+}
+
+/// The other side of that predicate: a pending key that activates BEFORE (or
+/// with) the new one is not cut short. It signs in its turn, and the later key
+/// takes over from it.
+#[test]
+fn a_rotation_leaves_alone_a_pending_key_that_activates_no_later() {
+    let s = store("overlap-keep");
+    let issuer = s.boot();
+    let sooner = issuer.rotate(Some(10), "test").unwrap();
+    let later = issuer.rotate(Some(100), "test").unwrap();
+    let same = issuer.rotate(Some(100), "test").unwrap();
+
+    let row = |kid: &str| s.rows().into_iter().find(|r| r.kid == kid).unwrap();
+    assert!(row(&sooner.kid)
+        .retire_at
+        .is_some_and(|at| at.secs() > T0.secs() + 100));
+    assert!(row(&later.kid)
+        .retire_at
+        .is_some_and(|at| at.secs() > T0.secs() + 100));
+    assert_eq!(row(&same.kid).retire_at, None);
+
+    s.clock.set(T0.plus_secs(10));
+    assert_eq!(issuer.signing_kid(), Some(sooner.kid.clone()));
+    // Tied on `activate_at`: the one made last signs.
+    s.clock.set(T0.plus_secs(100));
+    assert_eq!(issuer.signing_kid(), Some(same.kid.clone()));
+}
+
 /// `rotate-signing-key` is another process writing the same file. The running
 /// broker converges on it at its next reload, with no signal — and not before.
 #[test]

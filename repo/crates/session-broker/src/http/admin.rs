@@ -98,6 +98,10 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/admin/tenants/{tenant}", delete(identity::disable_tenant))
         .route(
+            "/admin/tenants/{tenant}/enable",
+            post(identity::enable_tenant),
+        )
+        .route(
             "/admin/principals",
             get(identity::list_principals).post(identity::create_principal),
         )
@@ -1328,7 +1332,7 @@ mod tests {
 
     /// Every route on the lane, one entry each. A new route that is not listed
     /// here is not covered by the refusal tests, so add it.
-    const ALL_ROUTES: [(&str, &str); 22] = [
+    const ALL_ROUTES: [(&str, &str); 23] = [
         ("GET", "/admin/api-keys"),
         ("DELETE", "/admin/api-keys/bk_x"),
         ("GET", "/admin/sessions"),
@@ -1339,6 +1343,7 @@ mod tests {
         ("GET", "/admin/tenants"),
         ("POST", "/admin/tenants"),
         ("DELETE", "/admin/tenants/acme"),
+        ("POST", "/admin/tenants/acme/enable"),
         ("GET", "/admin/principals"),
         ("POST", "/admin/principals"),
         ("GET", "/admin/principals/sp_x"),
@@ -1944,6 +1949,48 @@ mod tests {
         assert_eq!(resolves(&l, &secret), None);
     }
 
+    /// Disabling is not a one-way door: enabling brings the tenant, and with it
+    /// every principal and grant that was behind it, back.
+    #[tokio::test]
+    async fn an_enabled_tenant_gives_its_principals_back() {
+        let l = lane();
+        let (id, secret) = new_principal(&l, "edge").await;
+        call(&l, "DELETE", "/admin/tenants/acme", None).await;
+        assert_eq!(resolves(&l, &secret), None);
+
+        // Matches: disabled.
+        let (status, _) = call(&l, "POST", "/admin/tenants/acme/enable", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(resolves(&l, &secret).as_deref(), Some(id.as_str()));
+        assert_eq!(repo::list_tenants(&fresh(&l)).unwrap()[0].disabled_at, None);
+        let (_, listed) = call(&l, "GET", "/admin/tenants", None).await;
+        assert_eq!(listed[0]["live"], true);
+        let (status, _) = call(&l, "POST", "/admin/principals", Some(ingest_body("more"))).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Does not match: already enabled, and no such tenant. Each is a
+        // refusal with its own failure row.
+        for tenant in ["acme", "nowhere"] {
+            let (status, body) =
+                call(&l, "POST", &format!("/admin/tenants/{tenant}/enable"), None).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::NOT_FOUND, Some("unknown_tenant")),
+                "{tenant}"
+            );
+        }
+        let rows = audit_rows(&l, crate::audit::action::TENANT_ENABLED);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].row.outcome, "success");
+        assert_eq!(rows[2].row.key_id.as_deref(), Some("acme"));
+        assert_eq!(rows[0].row.outcome, "failure");
+        assert_eq!(rows[0].row.reason.as_deref(), Some("not_found"));
+
+        // And the door swings both ways.
+        call(&l, "DELETE", "/admin/tenants/acme", None).await;
+        assert_eq!(resolves(&l, &secret), None);
+    }
+
     #[tokio::test]
     async fn user_grants_are_created_listed_revoked_and_can_be_granted_again() {
         let l = lane();
@@ -2109,6 +2156,7 @@ mod tests {
         .await; // RevokePrincipalSecret
         call(&l, "DELETE", &format!("/admin/principals/{id}"), None).await; // RevokePrincipal
         call(&l, "DELETE", "/admin/tenants/solo", None).await; // DisableTenant
+        call(&l, "POST", "/admin/tenants/solo/enable", None).await; // EnableTenant
         call(
             &l,
             "POST",
@@ -2133,6 +2181,7 @@ mod tests {
                 [
                     TENANT_CREATED,
                     TENANT_DISABLED,
+                    TENANT_ENABLED,
                     PRINCIPAL_CREATED,
                     PRINCIPAL_REVOKED,
                     PRINCIPAL_SECRET_ADDED,
@@ -2161,6 +2210,7 @@ mod tests {
             (PRINCIPAL_SECRET_REVOKED.to_owned(), Some(id.clone()), None),
             (TENANT_CREATED.to_owned(), Some("solo".to_owned()), None),
             (TENANT_DISABLED.to_owned(), Some("solo".to_owned()), None),
+            (TENANT_ENABLED.to_owned(), Some("solo".to_owned()), None),
             (
                 USER_GRANT_CREATED.to_owned(),
                 None,

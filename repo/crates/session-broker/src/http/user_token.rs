@@ -223,19 +223,27 @@ fn issue_inner(
     // --- what the user may have ----------------------------------------
     let grants = handle.signer.user_grants(&meta.sub).map_err(|e| {
         tracing::error!(target: "broker::issuer", error = %e, "user grant lookup failed");
-        ApiError::new(
-            ErrorCode::Unavailable,
-            "the token could not be issued right now; retry shortly",
-        )
+        unavailable()
     })?;
     let (tenant, roles, indexes) = if grants.live.is_empty() && !grants.any_row {
         // Never granted anything: the install's default, if it has one.
         match (&config.default_user_tenant, &request.tenant) {
-            (Some(default), asked) if asked.as_deref().is_none_or(|t| t == default) => (
-                default.clone(),
-                config.default_user_roles.clone(),
-                vec!["*".to_owned()],
-            ),
+            (Some(default), asked) if asked.as_deref().is_none_or(|t| t == default) => {
+                // The default is a grant the install makes for the user; a
+                // tenant the operator disabled grants nothing.
+                let disabled = handle.signer.tenant_is_disabled(default).map_err(|e| {
+                    tracing::error!(target: "broker::issuer", error = %e, "tenant lookup failed");
+                    unavailable()
+                })?;
+                if disabled {
+                    return Err(not_granted());
+                }
+                (
+                    default.clone(),
+                    config.default_user_roles.clone(),
+                    vec!["*".to_owned()],
+                )
+            }
             _ => return Err(not_granted()),
         }
     } else {
@@ -285,10 +293,7 @@ fn issue_inner(
     };
     let (kid, access_token) = handle.signer.sign_with_kid(&claims).map_err(|e| {
         tracing::error!(target: "broker::issuer", error = %e, "token could not be signed");
-        ApiError::new(
-            ErrorCode::Unavailable,
-            "the token could not be issued right now; retry shortly",
-        )
+        unavailable()
     })?;
 
     attempt.issued = Some(IssuedFacts {
@@ -306,6 +311,13 @@ fn issue_inner(
         roles,
         indexes,
     })
+}
+
+fn unavailable() -> ApiError {
+    ApiError::new(
+        ErrorCode::Unavailable,
+        "the token could not be issued right now; retry shortly",
+    )
 }
 
 fn not_granted() -> ApiError {

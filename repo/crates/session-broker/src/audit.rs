@@ -53,6 +53,7 @@ pub mod action {
     pub const SIGNING_KEY_REMOVED: &str = "signing_key.removed";
     pub const TENANT_CREATED: &str = "tenant.created";
     pub const TENANT_DISABLED: &str = "tenant.disabled";
+    pub const TENANT_ENABLED: &str = "tenant.enabled";
     pub const PRINCIPAL_CREATED: &str = "principal.created";
     pub const PRINCIPAL_REVOKED: &str = "principal.revoked";
     pub const PRINCIPAL_SECRET_ADDED: &str = "principal.secret_added";

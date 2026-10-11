@@ -758,6 +758,44 @@ async fn wrong_secrets_run_out_per_client_id_with_no_client_ip_configured() {
     assert_eq!(h.audit(action::TOKEN_ISSUANCE_REFUSED).len(), 3 + 1 + 3);
 }
 
+/// An id the store has never issued is attacker-chosen text: a budget per id
+/// would be a fresh budget per request, and a fresh audit row with it.
+#[tokio::test]
+async fn ids_that_name_no_principal_share_one_budget_and_one_trickle_of_audit_rows() {
+    let h = harness_with("limit-unknown", true, Some(3));
+    let p = h.principal("edge", serde_json::json!({})).await;
+    let wrong = format!("sbp_{}", "F".repeat(43));
+
+    // Matches the shared bucket: ids that look right and exist nowhere.
+    for n in 0..3 {
+        let response = h.token(&format!("sp_guess{n}"), &wrong, "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "guess {n}");
+    }
+    for n in 3..20 {
+        let response = h.token(&format!("sp_guess{n}"), &wrong, "").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "guess {n}"
+        );
+    }
+    // One row per spent unit of the shared budget, none for the rest.
+    assert_eq!(h.audit(action::TOKEN_ISSUANCE_REFUSED).len(), 3);
+
+    // Does not match: a real principal keeps a budget of its own, and its
+    // right secret was never in the shared bucket's way.
+    for guess in 0..3 {
+        let response = h.token(&p.id, &wrong, "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "guess {guess}");
+    }
+    assert_eq!(
+        h.token(&p.id, &wrong, "").await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    granted(h.token(&p.id, &p.secret, "").await).await;
+    assert_eq!(h.audit(action::TOKEN_ISSUANCE_REFUSED).len(), 6);
+}
+
 #[tokio::test]
 async fn issuance_is_recorded_once_per_window_and_every_refusal_is_recorded() {
     let h = harness("audit");

@@ -439,7 +439,8 @@ guard as the rest of `/admin/*`; every mutation is Tier A. No tokens are issued
 yet — nothing resolves a principal secret until S4.
 
 - **Routes**: `GET|POST /admin/tenants`, `DELETE /admin/tenants/{tenant}`
-  (disable); `GET|POST /admin/principals` (`?tenant=`),
+  (disable), `POST /admin/tenants/{tenant}/enable` (undo it; Tier A
+  `tenant.enabled`); `GET|POST /admin/principals` (`?tenant=`),
   `GET|DELETE /admin/principals/{id}`; `POST /admin/principals/{id}/secrets`,
   `DELETE /admin/principals/{id}/secrets/{secret_id}`; `GET|POST
   /admin/user-grants` (`?tenant=&sub=`), `DELETE /admin/user-grants/{sub}/{tenant}`;
@@ -574,6 +575,19 @@ A signed-in user trades their session for a signed token. Public listener,
   per `audit_coalesce_secs`; `token.issuance_refused` once a user is known
   (reason = the error code), never coalesced. A forged or cookie-less request is
   counted in the metric only. `broker_tokens_issued_total{kind="user",outcome}`.
+
+## Added since (2026-10-11) — token issuer, review fixes
+
+- **Rotation overlap (ISS-1).** `rotate_signing_key` also unpublishes, at `now`,
+  any key that has not started and would activate after the new one, so an
+  earlier, slower rotation cannot take signing back from a later, faster one.
+- **Default tenant (ISS-2).** The `default_user_tenant` fallback on
+  `POST /session/token` answers `not_granted` when that tenant is disabled.
+- **Failure limiter (ISS-3).** `/auth/token` gives a budget of its own only to
+  an id that names a principal row; every other id shares one `unknown` bucket,
+  so refusals and their audit rows are bounded by the limiter.
+- **Tenant enable (ISS-4).** `POST /admin/tenants/{tenant}/enable`
+  (`AdminWrite::EnableTenant`, sent by that handler only).
 
 ## Known gaps that remain
 

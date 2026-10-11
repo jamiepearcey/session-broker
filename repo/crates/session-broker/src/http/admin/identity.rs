@@ -20,7 +20,7 @@
 //! Nobody has to create a tenant. Naming one in a principal or a grant creates
 //! it, in the same transaction. A disabled tenant refuses new principals and
 //! grants and its principals stop resolving; it is not re-enabled by being named
-//! again.
+//! again, only by `POST /admin/tenants/{tenant}/enable`.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -324,6 +324,37 @@ pub(super) async fn disable_tenant(
             StatusCode::NOT_FOUND,
             "unknown_tenant",
             "No enabled tenant with that name.",
+        ),
+        Err(response) => *response,
+    }
+}
+
+pub(super) async fn enable_tenant(
+    State(state): State<AdminState>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    Path(tenant): Path<String>,
+) -> Response {
+    if let Err(response) = authorised(&state, &headers, peer.as_ref()) {
+        return *response;
+    }
+    let now = state.clock.now();
+    let event = admin_event(action::TENANT_ENABLED, now).key_id(tenant.clone());
+    match apply(
+        &state,
+        AdminWrite::EnableTenant {
+            tenant_id: tenant.clone(),
+        },
+        event,
+    ) {
+        Ok(true) => {
+            tracing::info!(tenant = %tenant, "admin: tenant enabled");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => refuse(
+            StatusCode::NOT_FOUND,
+            "unknown_tenant",
+            "No disabled tenant with that name.",
         ),
         Err(response) => *response,
     }

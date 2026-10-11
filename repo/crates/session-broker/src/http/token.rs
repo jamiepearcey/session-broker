@@ -24,7 +24,8 @@
 //! learn which of them is true.
 //!
 //! **Wrong credentials are budgeted per `client_id`**, not per client address,
-//! so the limit works with no client-IP header configured. Only a failure
+//! so the limit works with no client-IP header configured. Ids that name no
+//! principal share one budget between them. Only a failure
 //! spends from the budget, and it is spent after the check: a principal with
 //! the right secret is never locked out by someone else guessing against its
 //! id. Past the budget a wrong guess answers 429 and is no longer recorded.
@@ -257,9 +258,16 @@ pub async fn issue(
 /// the budget is spent: answer 429 instead of the 401.
 fn spend_failure(state: &AppState, handle: &IssuerHandle, attempt: &Attempt) -> Option<Response> {
     let limiter = handle.client_failures.as_ref()?;
-    // Ids that are not shaped like one share a bucket, so free text cannot be
-    // used to fill the limiter's table.
-    let id = attempt.client_id.as_deref().unwrap_or("malformed");
+    // Only an id that names a principal gets a budget of its own. Anything
+    // else, whether not shaped like an id or shaped right and issued to no
+    // one, is text the caller made up, and a bucket per made-up string is a
+    // fresh budget per request. They share one. A store error counts as
+    // unknown: the failure is already being answered.
+    let id = attempt
+        .client_id
+        .as_deref()
+        .filter(|id| handle.signer.principal_exists(id).unwrap_or(false))
+        .unwrap_or("unknown");
     let Decision::Deny { retry_after } = limiter.check(&format!("{FAILURE_BUCKET}:{id}")) else {
         return None;
     };

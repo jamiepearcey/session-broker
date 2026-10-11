@@ -659,6 +659,57 @@ async fn a_user_with_no_grant_is_refused_unless_the_install_has_a_default_tenant
     );
 }
 
+/// The default-tenant fallback is a grant the install makes on the user's
+/// behalf; a tenant the operator disabled grants nothing, same as the
+/// explicit-grant path.
+#[tokio::test]
+async fn the_default_tenant_fallback_stops_when_that_tenant_is_disabled() {
+    let h = harness_with(
+        "default-off",
+        true,
+        Some("default"),
+        SessionPolicy::default(),
+    );
+    let (cookie, _) = h.login("stranger");
+
+    // Matches: the default tenant is live.
+    assert_eq!(
+        granted(h.mint(&cookie, audience()).await).await["tenant"],
+        "default"
+    );
+
+    // Does not match: the default tenant disabled.
+    assert_eq!(
+        h.admin("DELETE", "/admin/tenants/default", None).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        refused(h.mint(&cookie, audience()).await).await,
+        (StatusCode::FORBIDDEN, "not_granted".to_owned())
+    );
+    assert_eq!(
+        refused(
+            h.mint(
+                &cookie,
+                serde_json::json!({ "audience": "logless", "tenant": "default" })
+            )
+            .await
+        )
+        .await,
+        (StatusCode::FORBIDDEN, "not_granted".to_owned())
+    );
+
+    // Matches again once the operator enables it.
+    assert_eq!(
+        h.admin("POST", "/admin/tenants/default/enable", None).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        granted(h.mint(&cookie, audience()).await).await["tenant"],
+        "default"
+    );
+}
+
 // --- off, audit, metrics, INV-12 --------------------------------------------
 
 #[tokio::test]

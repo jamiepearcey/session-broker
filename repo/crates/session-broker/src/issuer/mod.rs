@@ -284,6 +284,24 @@ impl Issuer {
             .map_err(|e| IssuerError::Store(e.to_string()))
     }
 
+    /// Whether `tenant` has been disabled. A slug nobody has named is not
+    /// disabled: the install's default tenant is created by its first use.
+    pub fn tenant_is_disabled(&self, tenant: &str) -> Result<bool, IssuerError> {
+        self.reader
+            .with(|conn| repo::tenant_is_disabled(conn, tenant))
+            .map_err(|e| IssuerError::Store(e.to_string()))
+    }
+
+    /// Whether a principal row exists under `principal_id`, live or revoked.
+    /// The failure limiter uses it to tell an id worth a budget of its own from
+    /// one a caller made up.
+    pub fn principal_exists(&self, principal_id: &str) -> Result<bool, IssuerError> {
+        self.reader
+            .with(|conn| repo::get_principal(conn, principal_id))
+            .map(|row| row.is_some())
+            .map_err(|e| IssuerError::Store(e.to_string()))
+    }
+
     /// Record that a principal was issued a token, at most once per
     /// [`TOUCH_INTERVAL_SECS`]. Write-behind: issuance never waits on it.
     pub fn record_use(&self, principal_id: &str) {
