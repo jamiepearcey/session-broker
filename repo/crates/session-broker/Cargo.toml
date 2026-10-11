@@ -10,6 +10,7 @@ axum.workspace = true
 base64.workspace = true
 chacha20poly1305.workspace = true
 dashmap.workspace = true
+ed25519-dalek.workspace = true
 openidconnect.workspace = true
 rand.workspace = true
 reqwest.workspace = true
@@ -29,6 +30,9 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# DEV ONLY: an independent JWS implementation, so the issuer's tokens are
+# verified by code that shares none of `issuer::jwt`. Never a runtime dependency.
+jsonwebtoken.workspace = true
 mock-idp = { path = "../mock-idp" }
 proptest.workspace = true
 serde_json.workspace = true

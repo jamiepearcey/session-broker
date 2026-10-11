@@ -23,8 +23,15 @@ ignore = [
   # warns at startup it must never be deployed — it is not in the release
   # binary's dependency graph.
   #
+  # The broker DOES now hold private keys of its own: it signs the tokens it
+  # issues (docs/design/token-issuer-scope.md). Those keys are Ed25519, signed
+  # with `ed25519-dalek`; the `rsa` crate is not on that path and there is
+  # still no RSA private key anywhere in the release binary, so the reasoning
+  # above is unchanged. `jsonwebtoken` (which can do RSA) is a dev-dependency
+  # of the broker, used only by tests to verify those tokens independently.
+  #
   # Revisit when: `openidconnect` moves to an `rsa` release carrying a fix, or
-  # the broker ever gains a private key of its own (it should not — issuing
-  # tokens is the IdP's job, and ADR-0001 says this service is not one).
+  # the broker is ever asked to sign with RSA (RS256/PS256) — at that point an
+  # RSA private key exists in the deployment and this ignore must go.
   "RUSTSEC-2023-0071",
 ]

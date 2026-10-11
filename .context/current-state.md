@@ -1,6 +1,6 @@
 # Current State
 
-_Last updated: 2026-10-03_
+_Last updated: 2026-10-11_
 
 ## Status
 
@@ -395,6 +395,230 @@ open — delete development databases. The keyfile format is backward compatible
 | `rotate-key` + restart | ✅ `resealed=1`; raw column header `01 02`; same `/internal/token` access token still served |
 
 189 crate tests, clippy clean under `-D warnings`.
+
+## Added since (2026-10-11) — token issuer, slice S1: signing core and schema v5
+
+First of seven slices (`docs/design/token-issuer-scope.md` is the scope;
+`token-issuer.md` the fuller design it overrides). Nothing issues a token yet:
+this slice is the keys and the signer.
+
+- **Schema v5**, one migration: `tenant` (a `default` row pre-seeded),
+  `principal`, `principal_secret`, `user_grant`, `signing_key`. Only
+  `signing_key` has code behind it so far.
+- **`issuer/`**: Ed25519 keys in the store, seed sealed under the custody
+  keyring (AAD `signing:<kid>:seed`); a compact-JWS signer (`alg=EdDSA`,
+  `typ=JWT`); an in-memory key cache that re-reads the store every 60 s.
+  `kid` = base64url(SHA-256(public key)[..8]).
+- **No state column.** Pending / signing / published are derived from
+  `activate_at` / `retire_at` / `removed_at` against the clock.
+- **First boot creates one key** with a Tier A `signing_key.created` row. From S3
+  this happens only when the issuer is configured (`token_issuer` and
+  `issuer_audiences`); an unconfigured broker creates no key.
+- **Rotation is an operation**: `POST /admin/signing-keys/rotate`
+  (`{"activate_in_secs": N}`, default a day) and
+  `session-broker rotate-signing-key [--now]`. Zero lead = emergency: the new key
+  signs now and every older key is unpublished now.
+- **Prune** rides the hourly audit-prune timer and marks keys past `retire_at`
+  removed (`signing_key.removed`). It runs even with `audit_retention_days = 0`.
+- **Boot `Reseal` now covers `signing_key.seed_sealed`** as well as custody.
+- `ed25519-dalek` is a direct dependency (it was already in the graph);
+  `jsonwebtoken` is a dev-dependency of the broker, so tokens are verified in
+  tests by code that shares nothing with the encoder.
+
+**One bug found by running it, not by the tests:** after a rotation with a lead,
+an emergency rotation left the original key published for two more days — the
+UPDATE only dated keys with `retire_at IS NULL`. It now also pulls an earlier
+date onto keys dated later, with a regression test.
+
+206 crate tests (was 189), clippy clean under `-D warnings`.
+
+## Added since (2026-10-11) — token issuer, slice S2: tenants, principals, grants
+
+Identities as data on the admin lane (`http/admin/identity.rs`), same admin-key
+guard as the rest of `/admin/*`; every mutation is Tier A. No tokens are issued
+yet — nothing resolves a principal secret until S4.
+
+- **Routes**: `GET|POST /admin/tenants`, `DELETE /admin/tenants/{tenant}`
+  (disable), `POST /admin/tenants/{tenant}/enable` (undo it; Tier A
+  `tenant.enabled`); `GET|POST /admin/principals` (`?tenant=`),
+  `GET|DELETE /admin/principals/{id}`; `POST /admin/principals/{id}/secrets`,
+  `DELETE /admin/principals/{id}/secrets/{secret_id}`; `GET|POST
+  /admin/user-grants` (`?tenant=&sub=`), `DELETE /admin/user-grants/{sub}/{tenant}`;
+  `GET /admin/signing-keys` (derived `pending|signing|published|retired|removed`).
+  They work whether or not the issuer is configured; only rotation needs it.
+- **Secrets**: `sbp_` + 32 random bytes (base64url), shown once, SHA-256 of the
+  whole string at rest. **No expiry by default.** Creating a principal returns
+  its first secret; adding one leaves the older ones valid. Optional
+  `expires_in_secs` dates the new secret; optional `expire_old_in_secs` dates the
+  older live ones (never later than they already were; `0` is now). Ids: `sp_`
+  principals, `sps_` secrets.
+- **No tenant step**: naming a tenant slug in a principal or grant creates it in
+  the same transaction. A disabled tenant refuses new principals and grants and
+  its principals stop resolving. A revoked principal keeps its name (the
+  `UNIQUE (tenant_id, name)` from v5).
+- **`repo::find_live_principal_by_secret(conn, hash, now)`** is the lookup S4
+  will use: secret not revoked and not past `expires_at`, principal not revoked,
+  tenant not disabled. Tests drive the clock across each term.
+- **Grants** are keyed `(sub, tenant)`: a revoked grant is revived in place by
+  creating it again; a live one is a 409.
+- Unapplied creates (name taken, grant live, tenant disabled) answer 409 and
+  leave a `failure` audit row with reason `conflict`; unapplied revokes 404.
+- Not audited on their own: a tenant created implicitly by a principal or grant.
+  It rides inside that row's transaction and shows in `GET /admin/tenants`.
+
+## Added since (2026-10-11) — token issuer, slice S3: publication and config
+
+The issuer is on only when `token_issuer` and `issuer_audiences` are both set
+(one without the other is a startup error). Off, no signing key is created and
+both documents answer `501 lane_disabled`.
+
+- **Routes (public listener)**: `GET /auth/jwks.json` (every published key,
+  pending ones included) and `GET /.well-known/oauth-authorization-server`
+  (`issuer`, `jwks_uri`, `response_types_supported`; the token endpoint is added
+  by S4). Both send `Cache-Control: public, max-age=<issuer_jwks_max_age_secs>,
+  stale-if-error=2592000`, an `ETag` (304 on `If-None-Match`) and a `Date`. The
+  hardening layer only adds `no-store` when a handler set no `Cache-Control`, so
+  these are untouched; a test runs them through that layer.
+- **Config** (`BROKER_*` or the file): `token_issuer` (equal to `base_url` or a
+  URL under it, no query or fragment, trailing slash dropped), `issuer_audiences`
+  (comma list), `issuer_machine_ttl_secs=86400`, `issuer_user_ttl_secs=3600`,
+  `issuer_max_ttl_secs=2592000`, `signing_key_publish_lead_secs=86400`,
+  `issuer_jwks_max_age_secs=300`. The TTLs must be 1..=`issuer_max_ttl_secs`
+  (itself 1..=365 days); the lead 1..=30 days. `jwks_uri` is `base_url` +
+  `/auth/jwks.json`. `BrokerConfig.issuer: Option<IssuerConfig>`;
+  `IssuerConfig::key_policy()` feeds `bootstrap`, the rotate route and the CLI.
+- **No `issuer_allow_plaintext`, no introspection setting.** An `http://` issuer
+  off loopback logs one warning at start and is allowed. (`base_url` itself is
+  still refused off loopback over http by `HttpConfig::new`, so today that warning
+  can only fire if that rule is relaxed.)
+- **Wiring**: `AppState.issuer: Option<IssuerHandle { signer, config }>`;
+  `AdminState.issuer` keeps the bare `Arc<Issuer>`.
+
+## Added since (2026-10-11) — token issuer, slice S4: machine tokens
+
+`POST /auth/token` on the public listener: a service principal trades its secret
+for a signed token (OAuth client credentials). `501 lane_disabled` until the
+issuer is configured.
+
+- **Request**: `application/x-www-form-urlencoded` only.
+  `grant_type=client_credentials`, `client_id` (the `sp_` id), `client_secret`
+  (the `sbp_` secret), optional `scope` (space-separated, a subset of the
+  principal's) and optional `ttl` (seconds, at most the principal's
+  `max_ttl_secs` and `issuer_max_ttl_secs`). The id and secret may come in HTTP
+  Basic instead; both at once is `invalid_request`. Unknown fields, `tenant` and
+  `audience` among them, are ignored.
+- **Response**: `{access_token, token_type: "Bearer", expires_in, scope}`,
+  `no-store`. Default lifetime is `issuer_machine_ttl_secs`, lowered to the
+  principal's maximum.
+- **Claims**, all from the principal's row: `iss`, `sub` (principal id), `aud`
+  (one string), `exp`, `iat`, `jti`, `tenant`, `kind`, `name`, `scopes`,
+  `indexes`. Header `alg=EdDSA`, `typ=JWT`, `kid`.
+- **Refusals** are `{error, error_description}`: `invalid_request` 400 (not a
+  form, missing `grant_type`, a parameter sent twice, bad or too-long `ttl`),
+  `unsupported_grant_type` 400, `invalid_client` 401 with `WWW-Authenticate`
+  (one identical body for an unknown id, a wrong, revoked or expired secret, a
+  revoked principal, a disabled tenant), `invalid_scope` 400,
+  `unauthorized_client` 400 (the principal's audience is not in
+  `issuer_audiences`), `rate_limited` 429 with `Retry-After`,
+  `temporarily_unavailable` 503 (store unreadable or no signing key),
+  `lane_disabled` 501.
+- **Rate limit**: wrong credentials only, one bucket per `client_id`
+  (`rate_limit_auth_failure_burst` per `rate_limit_auth_failure_per_secs`, off
+  with `rate_limit_enabled=false`). It does not depend on a client-IP header.
+  The budget is spent after the check, so the holder of the right secret is
+  never locked out by someone guessing against its id. There is no limit on
+  successful issuance.
+- **`last_used_at`** on the principal is written at most once a minute per
+  principal (`AdminWrite::TouchPrincipal`, sent by `Issuer::record_use`).
+- **Audit** (Tier B): `token.issued`, one row per (principal, audience) per
+  `audit_coalesce_secs`, detail `{aud, kind, tenant, kid, jti, ttl}`;
+  `token.issuance_refused`, one row per refusal, reason = the error code. Not
+  recorded: a request that names no credential (counted in the metric only), a
+  429, a 501, a 503.
+- **Metric**: `broker_tokens_issued_total{kind,outcome}`; `kind` is the
+  principal's kind, or `machine` before the caller is identified.
+- **Metadata** now carries `token_endpoint`, `grant_types_supported` and
+  `token_endpoint_auth_methods_supported`.
+- An issued token cannot be revoked. Revoking the principal or the secret stops
+  the next one.
+
+### S5: user tokens (`POST /session/token`)
+
+A signed-in user trades their session for a signed token. Public listener,
+`501 lane_disabled` until the issuer is configured.
+
+- **Request**: cookie-authenticated, JSON `{"audience", "tenant"?}`. INV-2 runs
+  first (`403 csrf_rejected`). The session must be `Active`, exactly as `/authz`
+  requires: no cookie or an unknown one is `401 invalid_session`, a stale
+  generation `401 session_stale` (refresh, retry), an expired or logged-out
+  session `401 session_expired`.
+- **Response**: `{access_token, token_type: "Bearer", expires_in, tenant, roles,
+  indexes}`, `no-store`. Lifetime is `issuer_user_ttl_secs`, cut short at the
+  session's idle expiry.
+- **Claims**: `iss`, `sub` (the identity provider subject), `sid` (the broker
+  session id, never the cookie), `aud`, `exp`, `iat`, `jti`, `kind: "user"`,
+  `tenant`, `roles`, `indexes`. Header `alg=EdDSA`, `typ=JWT`, `kid`.
+- **Tenant, roles and indexes come only from `user_grant`** for the subject
+  (`repo::find_live_user_grants`: not revoked, tenant not disabled). One grant:
+  `tenant` may be omitted. Several and no `tenant`: `400 bad_request`. A tenant
+  with no grant: `403 not_granted`. `audience` must be in `issuer_audiences`:
+  `400 bad_audience`.
+- **Single-tenant default** (scope addendum): a subject the table has never held
+  a row for gets `default_user_tenant` (default `default`) with
+  `default_user_roles` (default `viewer`) and `indexes: ["*"]`. `none` (or empty
+  in the file) turns it off. A subject whose grants were all revoked, or sit in
+  a disabled tenant, is NOT rescued by the default: `403 not_granted`.
+- **`/internal/token` is unchanged** (the scope addendum dropped the opt-in
+  `token_type: "broker"`), as is `/authz`.
+- **Audit** (Tier B, actor `user`): `token.issued` carries `subject` and `sid`,
+  detail `{aud, kind, tenant, kid, jti, ttl}`, coalesced per (subject, audience)
+  per `audit_coalesce_secs`; `token.issuance_refused` once a user is known
+  (reason = the error code), never coalesced. A forged or cookie-less request is
+  counted in the metric only. `broker_tokens_issued_total{kind="user",outcome}`.
+
+## Added since (2026-10-11) — token issuer, review fixes
+
+- **Rotation overlap (ISS-1).** `rotate_signing_key` also unpublishes, at `now`,
+  any key that has not started and would activate after the new one, so an
+  earlier, slower rotation cannot take signing back from a later, faster one.
+- **Default tenant (ISS-2).** The `default_user_tenant` fallback on
+  `POST /session/token` answers `not_granted` when that tenant is disabled.
+- **Failure limiter (ISS-3).** `/auth/token` gives a budget of its own only to
+  an id that names a principal row; every other id shares one `unknown` bucket,
+  so refusals and their audit rows are bounded by the limiter.
+- **Tenant enable (ISS-4).** `POST /admin/tenants/{tenant}/enable`
+  (`AdminWrite::EnableTenant`, sent by that handler only).
+
+## Added since (2026-10-11) — token issuer, slices S6 and S7: console, contract, verifier
+
+- **Console (S6)**: Principals (tenant filter, create form, one-shot secret panel,
+  add and revoke secrets, revoke principal), User grants and Signing keys views in
+  `repo/ui/apps/console`, over the admin lane. Merged from `wf/issuer-console`;
+  the only overlap was `lib/api.ts`, which merged without conflict.
+- **ADR-0017** records the decision: the broker becomes a token issuer, amending
+  ADR-0001 (it holds tenants, principals and grants as data but still evaluates no
+  policy and is not an IdP) and ADR-0006 (sessions stay opaque; a JWKS now exists
+  for the tokens it signs). It also holds the "deliberately not built" list and the
+  honest limits from `docs/design/token-issuer-scope.md`.
+- **`docs/openapi.yaml`**: tag `issuer`, every new path (`/auth/token`,
+  `/auth/jwks.json`, `/.well-known/oauth-authorization-server`, `/session/token`,
+  and the `/admin/{tenants,principals,user-grants,signing-keys}` family), their
+  schemas, the `principalSecret` scheme. `/internal/token` is NOT extended (the
+  scope addendum dropped `token_type: "broker"`); its description says so.
+  `ApiError` was documented as `{code, message}`; the code has always sent
+  `{error, detail, login_url?}`, so the schema now says that.
+- **INV-12 and INV-13 reworded** for principal secrets, seeds, issued tokens, grants,
+  tenants and signing keys; `docs/architecture/observability.md` lists the new audit
+  actions and `broker_tokens_issued_total`.
+- **Verifier (S7)**: `docs/verifier/README.md` (the checks in order; clock allowance
+  300 s; key cache refreshed hourly, served from cache without a time limit while the
+  broker is unreachable) and `docs/verifier/vectors.json`, generated by
+  `issuer::vectors` from a fixed test-only seed (the seed is public in that source
+  file). The test fails if the committed file differs from what the signer produces;
+  `UPDATE_VECTORS=1 cargo test -p session-broker vectors` regenerates it. The same
+  test runs every vector through a reference verifier written from the README, so the
+  expected verdicts are checked rather than asserted.
+- **README** has a "create a principal, get a token" section with curl.
 
 ## Known gaps that remain
 

@@ -4,6 +4,10 @@
 
 Accepted (2026-07-26)
 
+Amended by [ADR-0017](ADR-0017-the-broker-as-a-token-issuer.md): the broker also signs
+and publishes keys for tokens it issues to downstream products. Sessions are unchanged:
+the cookie stays opaque and hashed, and a signed token is never a session.
+
 ## Context
 
 The session cookie is the credential the entire rotation/grace/logout model

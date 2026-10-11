@@ -103,6 +103,86 @@ pub enum AdminWrite {
         key_id: String,
         now: Timestamp,
     },
+    /// The first signing key, created at boot when the store has none.
+    InsertSigningKey {
+        key: repo::NewSigningKey,
+        now: Timestamp,
+    },
+    /// A new signing key that takes over at `activate_at`; every key before it
+    /// stops being published at `retire_at`.
+    RotateSigningKey {
+        key: repo::NewSigningKey,
+        now: Timestamp,
+        activate_at: Timestamp,
+        retire_at: Timestamp,
+    },
+    /// The prune: mark one key removed once it is past its `retire_at`.
+    RemoveRetiredSigningKey {
+        kid: String,
+        now: Timestamp,
+    },
+    InsertTenant {
+        tenant_id: String,
+        display_name: Option<String>,
+        now: Timestamp,
+    },
+    DisableTenant {
+        tenant_id: String,
+        now: Timestamp,
+    },
+    EnableTenant {
+        tenant_id: String,
+    },
+    /// A principal with its first secret, and its tenant if that is new.
+    InsertPrincipal {
+        principal: repo::NewPrincipal,
+        now: Timestamp,
+    },
+    RevokePrincipal {
+        principal_id: String,
+        now: Timestamp,
+    },
+    /// `last_used_at`, sent by the token lane at most once a minute per
+    /// principal.
+    TouchPrincipal {
+        principal_id: String,
+        now: Timestamp,
+    },
+    /// A further secret. `expire_others_at` dates the principal's older live
+    /// secrets; `None` leaves them valid until somebody revokes them.
+    AddPrincipalSecret {
+        principal_id: String,
+        secret: repo::NewSecret,
+        expire_others_at: Option<Timestamp>,
+        now: Timestamp,
+    },
+    RevokePrincipalSecret {
+        principal_id: String,
+        secret_id: String,
+        now: Timestamp,
+    },
+    InsertUserGrant {
+        grant: repo::NewUserGrant,
+        now: Timestamp,
+    },
+    RevokeUserGrant {
+        sub: String,
+        tenant_id: String,
+        now: Timestamp,
+    },
+}
+
+impl AdminWrite {
+    /// Why an unapplied write (`Ok(false)`) did nothing, for its audit row: a
+    /// create ran into something already there, anything else found nothing.
+    fn unapplied_reason(&self) -> &'static str {
+        match self {
+            AdminWrite::InsertTenant { .. }
+            | AdminWrite::InsertPrincipal { .. }
+            | AdminWrite::InsertUserGrant { .. } => "conflict",
+            _ => "not_found",
+        }
+    }
 }
 
 /// Write-behind mutations: session/generation/txn housekeeping. Enqueued and
@@ -163,8 +243,9 @@ pub enum Command {
         dead_before: Timestamp,
         txn_before: Timestamp,
     },
-    /// Move custody rows sealed under a retired key onto the active one.
-    /// Enqueued once at boot; a no-op when nothing is stale.
+    /// Move every sealed row (custody tokens, signing-key seeds) off a retired
+    /// key onto the active one. Enqueued once at boot; a no-op when nothing is
+    /// stale.
     Reseal,
     /// Liveness probe: applies nothing. See [`WriterHandle::is_alive`].
     Ping,
@@ -272,6 +353,26 @@ impl WriterHandle {
                 // Recording "a key was used" is what `last_used_at` is for; an
                 // audit row per use would be the coalescing problem ADR-0015
                 // solves for token exchange, without the audit value.
+                None,
+                ack_tx,
+            ))
+            .map_err(|_| "writer thread is gone".to_owned())
+    }
+
+    /// Record that a principal was issued a token. Fire-and-forget, for the
+    /// same reason as [`WriterHandle::enqueue_touch`].
+    pub fn enqueue_principal_touch(
+        &self,
+        principal_id: &str,
+        now: Timestamp,
+    ) -> Result<(), String> {
+        let (ack_tx, _ack_rx) = mpsc::channel();
+        self.tx
+            .send(Command::Admin(
+                AdminWrite::TouchPrincipal {
+                    principal_id: principal_id.to_owned(),
+                    now,
+                },
                 None,
                 ack_tx,
             ))
@@ -515,6 +616,7 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                     }
                 }
                 Command::Admin(write, audit, ack) => {
+                    let unapplied_reason = write.unapplied_reason();
                     let outcome = match write {
                         AdminWrite::InsertApiKey {
                             key_id,
@@ -537,6 +639,64 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                         AdminWrite::TouchApiKey { key_id, now } => {
                             repo::touch_api_key(&tx, &key_id, now).map(|()| true)
                         }
+                        AdminWrite::InsertSigningKey { key, now } => {
+                            repo::insert_signing_key(&tx, &key, now, now).map(|()| true)
+                        }
+                        AdminWrite::RotateSigningKey {
+                            key,
+                            now,
+                            activate_at,
+                            retire_at,
+                        } => repo::rotate_signing_key(&tx, &key, now, activate_at, retire_at)
+                            .map(|()| true),
+                        AdminWrite::RemoveRetiredSigningKey { kid, now } => {
+                            repo::remove_retired_signing_key(&tx, &kid, now)
+                        }
+                        AdminWrite::InsertTenant {
+                            tenant_id,
+                            display_name,
+                            now,
+                        } => repo::insert_tenant(&tx, &tenant_id, display_name.as_deref(), now),
+                        AdminWrite::DisableTenant { tenant_id, now } => {
+                            repo::disable_tenant(&tx, &tenant_id, now)
+                        }
+                        AdminWrite::EnableTenant { tenant_id } => {
+                            repo::enable_tenant(&tx, &tenant_id)
+                        }
+                        AdminWrite::InsertPrincipal { principal, now } => {
+                            repo::insert_principal(&tx, &principal, now)
+                        }
+                        AdminWrite::RevokePrincipal { principal_id, now } => {
+                            repo::revoke_principal(&tx, &principal_id, now)
+                        }
+                        AdminWrite::TouchPrincipal { principal_id, now } => {
+                            repo::touch_principal(&tx, &principal_id, now).map(|()| true)
+                        }
+                        AdminWrite::AddPrincipalSecret {
+                            principal_id,
+                            secret,
+                            expire_others_at,
+                            now,
+                        } => repo::add_principal_secret(
+                            &tx,
+                            &principal_id,
+                            &secret,
+                            expire_others_at,
+                            now,
+                        ),
+                        AdminWrite::RevokePrincipalSecret {
+                            principal_id,
+                            secret_id,
+                            now,
+                        } => repo::revoke_principal_secret(&tx, &principal_id, &secret_id, now),
+                        AdminWrite::InsertUserGrant { grant, now } => {
+                            repo::insert_user_grant(&tx, &grant, now)
+                        }
+                        AdminWrite::RevokeUserGrant {
+                            sub,
+                            tenant_id,
+                            now,
+                        } => repo::revoke_user_grant(&tx, &sub, &tenant_id, now),
                     }?;
 
                     // Tier A: same transaction as the mutation, so there is no
@@ -549,30 +709,36 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                     if let Some(mut row) = audit {
                         if !outcome {
                             row.outcome = "failure".to_owned();
-                            row.reason = Some("not_found".to_owned());
+                            row.reason = Some(unapplied_reason.to_owned());
                         }
                         repo::insert_audit(&tx, &row)?;
                     }
                     admin_acks.push((ack, outcome));
                 }
                 Command::Reseal => {
-                    let report = repo::reseal_custody(&tx)?;
-                    if report.resealed > 0 || report.failed > 0 {
-                        tracing::info!(
-                            target: "broker::keys",
-                            resealed = report.resealed,
-                            already_current = report.current,
-                            unreadable = report.failed,
-                            "custody reseal under the active key"
-                        );
-                    }
-                    if report.failed > 0 {
-                        tracing::error!(
-                            target: "broker::keys",
-                            unreadable = report.failed,
-                            "custody rows could not be opened with any key in the keyfile; \
-                             they were left untouched"
-                        );
+                    let all = repo::reseal_all(&tx)?;
+                    for (what, report) in
+                        [("custody", all.custody), ("signing_key", all.signing_keys)]
+                    {
+                        if report.resealed > 0 || report.failed > 0 {
+                            tracing::info!(
+                                target: "broker::keys",
+                                table = what,
+                                resealed = report.resealed,
+                                already_current = report.current,
+                                unreadable = report.failed,
+                                "reseal under the active key"
+                            );
+                        }
+                        if report.failed > 0 {
+                            tracing::error!(
+                                target: "broker::keys",
+                                table = what,
+                                unreadable = report.failed,
+                                "sealed rows could not be opened with any key in the keyfile; \
+                                 they were left untouched"
+                            );
+                        }
                     }
                 }
                 Command::Ping => {}

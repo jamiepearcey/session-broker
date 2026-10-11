@@ -10,8 +10,12 @@ openapi: 3.1.0
 # THREE LANES, TWO LISTENERS:
 #
 #   public   (bind_addr)          /auth/*, /session*, /logout   — the browser
+#                                 /auth/token, /auth/jwks.json,
+#                                 /.well-known/oauth-authorization-server
+#                                                               — token issuer (ADR-0017)
 #   internal (internal_bind_addr) /internal/token               — backend services
 #   internal (internal_bind_addr) /admin/*                      — operators/console
+#                                 (incl. principals, grants, signing keys)
 #
 # The internal listener must not be internet-reachable. Both lanes on it still
 # require authentication regardless, because a bind address is a deployment
@@ -65,6 +69,15 @@ tags:
     description: Backend token exchange (internal lane, dual authentication).
   - name: admin
     description: Key, session and custody management (internal lane).
+  - name: issuer
+    description: |
+      The broker as a token issuer (ADR-0017). Off until `token_issuer` and
+      `issuer_audiences` are set; off, the public routes answer
+      `501 lane_disabled`. Public lane: `POST /auth/token` (machines),
+      `POST /session/token` (people), and the keys and metadata that verify
+      what they return. Internal lane: tenants, service principals and their
+      secrets, user grants and signing keys, all behind the admin key and all
+      audited in the same transaction (INV-13).
   - name: ops
     description: |
       Observability (internal lane). Two planes with different promises:
@@ -217,6 +230,254 @@ paths:
           headers:
             Set-Cookie: { schema: { type: string } }
 
+  /auth/token:
+    post:
+      tags: [issuer]
+      summary: Trade a service principal's secret for a signed token (client credentials).
+      description: |
+        OAuth 2.0 client credentials (RFC 6749 section 4.4) on the **public**
+        listener, because the machines that call it sit outside the operator
+        network. Answers `501 lane_disabled` until `token_issuer` and
+        `issuer_audiences` are configured.
+
+        **Every claim comes from the principal's row.** The request chooses only
+        a narrower `scope` and a shorter `ttl`. `tenant`, `audience` and any other
+        field are ignored, so a caller cannot ask for a different tenant.
+
+        The id and secret go either in the form body (`client_id`,
+        `client_secret`) or in HTTP Basic. Both secret locations at once is
+        `invalid_request`, and so is any parameter sent twice.
+
+        **One refusal for every dead credential.** An unknown id, a wrong,
+        revoked or expired secret, a revoked principal and a disabled tenant all
+        answer the same `401 invalid_client`, so the route cannot be used to learn
+        which is true.
+
+        **Wrong credentials are budgeted per `client_id`**, not per address, so
+        the limit works with no client-IP header configured. Ids that name no
+        principal share one budget. Only a failure spends from it, and it is spent
+        after the check, so the holder of the right secret is never locked out by
+        someone guessing against its id. Successful issuance is not limited.
+
+        An issued token cannot be revoked before it expires. Revoking the
+        principal or the secret stops the next one.
+      security:
+        - principalSecret: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type: { type: string, const: client_credentials }
+                client_id:
+                  type: string
+                  example: sp_a1b2c3d4e5f6g7h8
+                  description: The principal id. Omit when using HTTP Basic.
+                client_secret:
+                  type: string
+                  example: sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+                  description: The principal's secret. Omit when using HTTP Basic.
+                scope:
+                  type: string
+                  description: Space-separated; must be a subset of the principal's scopes. Default is all of them.
+                ttl:
+                  type: integer
+                  minimum: 1
+                  description: Seconds. At most the principal's `max_ttl_secs` and the issuer's maximum.
+      responses:
+        "200":
+          description: A signed token.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+            Pragma: { schema: { type: string, const: no-cache } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "400":
+          description: |
+            `invalid_request` (not a form, missing `grant_type`, a parameter sent
+            twice, Basic plus a body secret, a bad `ttl`), `unsupported_grant_type`,
+            `invalid_scope` (not a subset of the principal's), or
+            `unauthorized_client` (the principal's audience is not in
+            `issuer_audiences`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthError" }
+        "401":
+          description: "`invalid_client`. One identical body for every reason a credential does not work."
+          headers:
+            WWW-Authenticate:
+              schema: { type: string, example: 'Basic realm="session-broker", charset="UTF-8"' }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthError" }
+        "413":
+          description: "`invalid_request`. The body is over the 64 KiB limit."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthError" }
+        "429":
+          description: "`rate_limited`. Too many wrong credentials for this client id. Past the budget a wrong guess is no longer audited."
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthError" }
+        "501":
+          description: "`lane_disabled`. The issuer is not configured."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "503":
+          description: "`temporarily_unavailable`. The store could not be read or no signing key is usable. Retry."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthError" }
+
+  /auth/jwks.json:
+    get:
+      tags: [issuer]
+      summary: The keys that verify issued tokens.
+      description: |
+        Every **published** signing key, newest first: the one signing now,
+        older ones whose tokens may still be in flight, and pending ones that
+        start signing later (so a verifier learns a key before any token carries
+        it). Public by design; the keys are public keys.
+
+        Meant to be cached. `Cache-Control: public, max-age=<issuer_jwks_max_age_secs>,
+        stale-if-error=2592000`, an `ETag` that makes a refresh a 304, and a
+        `Date` header so a verifier can measure clock drift. See
+        `docs/verifier/README.md` for the cache policy.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: The JWK Set.
+          headers:
+            Cache-Control: { schema: { type: string, example: "public, max-age=300, stale-if-error=2592000" } }
+            ETag: { schema: { type: string } }
+            Date: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JwkSet" }
+        "304":
+          description: The caller's copy is current. Same headers, no body.
+        "501":
+          description: "`lane_disabled`. The issuer is not configured."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+
+  /.well-known/oauth-authorization-server:
+    get:
+      tags: [issuer]
+      summary: Issuer metadata (RFC 8414).
+      description: |
+        Names the issuer, where its keys are and where to ask for a token. Only
+        what exists is listed. Cached exactly like `/auth/jwks.json`.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: The metadata document.
+          headers:
+            Cache-Control: { schema: { type: string, example: "public, max-age=300, stale-if-error=2592000" } }
+            ETag: { schema: { type: string } }
+            Date: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssuerMetadata" }
+        "304":
+          description: The caller's copy is current. Same headers, no body.
+        "501":
+          description: "`lane_disabled`. The issuer is not configured."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+
+  /session/token:
+    post:
+      tags: [issuer]
+      summary: Trade the signed-in session for a signed user token.
+      description: |
+        For a console or app acting for a signed-in person. Cookie-authenticated
+        and held to the same bar as every state-changing cookie route: the INV-2
+        same-origin check runs first, then the session must be `Active`, exactly
+        as `/authz` and `/internal/token` require. A stale generation is told to
+        refresh first.
+
+        **Tenant, roles and indexes come only from the broker's `user_grant`
+        table** for the session's subject. The request chooses an audience (one
+        of `issuer_audiences`) and, for a person with several grants, which
+        tenant. Nothing the identity provider sent is read.
+
+        A subject the table has never held a row for gets `default_user_tenant`
+        (default `default`) with `default_user_roles` (default `viewer`) and
+        `indexes: ["*"]`, so a single-tenant install needs no admin step. A
+        subject whose every grant was revoked, or whose tenant is disabled, is
+        **not** rescued by the default: `403 not_granted`.
+
+        Lifetime is `issuer_user_ttl_secs`, cut short at the session's idle
+        expiry. `sid` in the token is the broker's session id, never the cookie.
+        The endpoint is drivable by script on the app origin, the same residual
+        ADR-0007 states for refresh.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [audience]
+              properties:
+                audience: { type: string, example: logless, description: One of the configured `issuer_audiences`. }
+                tenant:
+                  type: string
+                  description: Required only when the person holds grants on several tenants.
+      responses:
+        "200":
+          description: A signed user token.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+            Pragma: { schema: { type: string, const: no-cache } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserTokenResponse" }
+        "400":
+          description: |
+            `bad_request` (unreadable body, or several grants and no `tenant`)
+            or `bad_audience` (not in `issuer_audiences`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "401":
+          description: "`invalid_session` (no or unknown cookie), `session_stale` (refresh, then retry) or `session_expired`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "403":
+          description: "`csrf_rejected` (INV-2) or `not_granted` (no grant for that tenant, or the person has none and no default applies)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "501":
+          description: "`lane_disabled`. The issuer is not configured."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: "`unavailable`. The store could not be read or no signing key is usable."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /internal/token:
     post:
       tags: [internal]
@@ -229,6 +490,10 @@ paths:
         - a live session token proves *which* user — on its own it yields nothing,
           which is what stops a cookie stolen by XSS from being exchanged, since
           the browser does not hold the key.
+
+        This route is unchanged by the token issuer: it still returns the
+        upstream token. A broker-signed token for a signed-in person comes from
+        `POST /session/token`.
 
         **No inline refresh.** If the custodied access token has expired this
         answers `custody_unavailable` rather than calling the IdP (INV-8): a
@@ -419,6 +684,426 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Custody" }
         "401": { $ref: "#/components/responses/AdminUnauthorised" }
+
+  /admin/tenants:
+    get:
+      tags: [issuer]
+      summary: List tenants.
+      description: |
+        Ordered by tenant id. `default` is pre-seeded. A tenant is a label that
+        scopes what a consumer lets a token do; it is not an isolation boundary
+        inside the broker (ADR-0017).
+      security: [{ adminApiKey: [] }]
+      responses:
+        "200":
+          description: The tenants.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Tenant" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+    post:
+      tags: [issuer]
+      summary: Create a tenant.
+      description: |
+        Optional. Naming a new tenant slug on a principal or a user grant creates
+        it in the same transaction, so nobody has to call this first. Tier A
+        (`tenant.created`).
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tenant]
+              properties:
+                tenant: { $ref: "#/components/schemas/Slug" }
+                display_name: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "400":
+          description: "`bad_request`, `invalid_tenant` or `invalid_display_name`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "409":
+          description: "`tenant_exists`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/tenants/{tenant}:
+    delete:
+      tags: [issuer]
+      summary: Disable a tenant.
+      description: |
+        Its principals stop resolving at once (new tokens are refused as
+        `invalid_client`), its user grants stop counting, and it takes no new
+        principals or grants. Tokens already issued live out their lifetime.
+        Undo with `POST /admin/tenants/{tenant}/enable`. A disabled `default`
+        tenant also stops the single-tenant default for users. Tier A
+        (`tenant.disabled`).
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { $ref: "#/components/schemas/Slug" } }
+      responses:
+        "204": { description: Disabled. }
+        "404":
+          description: "`unknown_tenant`. No enabled tenant with that name."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/tenants/{tenant}/enable:
+    post:
+      tags: [issuer]
+      summary: Enable a disabled tenant.
+      description: Gives the tenant's principals and grants back. Tier A (`tenant.enabled`).
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { $ref: "#/components/schemas/Slug" } }
+      responses:
+        "204": { description: Enabled. }
+        "404":
+          description: "`unknown_tenant`. No disabled tenant with that name; an unknown tenant and an already-enabled one look alike."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/principals:
+    get:
+      tags: [issuer]
+      summary: List service principals.
+      description: Live and revoked, newest first, at most 64. Secrets are never returned.
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - name: tenant
+          in: query
+          required: false
+          description: Only this tenant's principals.
+          schema: { $ref: "#/components/schemas/Slug" }
+      responses:
+        "200":
+          description: The principals.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Principal" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+    post:
+      tags: [issuer]
+      summary: Create a service principal and its first secret.
+      description: |
+        The simple path: create a principal, take the secret, paste it into the
+        machine's config. **The secret is returned exactly once, here**; only its
+        SHA-256 is stored. It does not expire unless `expires_in_secs` is given.
+
+        The request body rejects unknown fields, so a typo such as `tenant_id`
+        cannot silently land a principal in `default`. A tenant slug that does not
+        exist yet is created in the same transaction. `audience` is checked for
+        shape only here; `/auth/token` refuses a principal whose audience is not
+        in `issuer_audiences`. Principals are not backend API keys: nothing on
+        `/internal/token`, `/authz` or `/admin/*` can resolve a principal secret.
+        Tier A (`principal.created`).
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewPrincipal" }
+      responses:
+        "201":
+          description: Created. Store the secret now; it cannot be retrieved again.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreatedPrincipal" }
+        "400":
+          description: |
+            `bad_request`, `invalid_tenant`, `invalid_name`, `invalid_kind`,
+            `invalid_scopes`, `invalid_indexes`, `invalid_audience`,
+            `max_ttl_out_of_range`, `expiry_out_of_range`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "409":
+          description: |
+            `principal_exists` (the name is taken in that tenant, revoked
+            principals included, because the name stays reserved) or
+            `tenant_disabled`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/principals/{principal_id}:
+    get:
+      tags: [issuer]
+      summary: One principal, with its secrets.
+      description: Secret ids and dates only. Never a secret.
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/PrincipalId" }
+      responses:
+        "200":
+          description: The principal.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrincipalDetail" }
+        "404":
+          description: "`unknown_principal`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+    delete:
+      tags: [issuer]
+      summary: Revoke a principal.
+      description: |
+        Stops new tokens at once. Tokens already issued live out their lifetime;
+        there is no revocation list. The principal's name stays reserved. Tier A
+        (`principal.revoked`).
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/PrincipalId" }
+      responses:
+        "204": { description: Revoked. }
+        "404":
+          description: "`unknown_principal`. No live principal with that id."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/principals/{principal_id}/secrets:
+    post:
+      tags: [issuer]
+      summary: Add a secret to a principal.
+      description: |
+        Rotation, as an operation. The new secret is returned once. **The older
+        secrets stay valid** until the operator revokes them, so nothing forces a
+        flag day; `expire_old_in_secs` dates them if the operator wants that (a
+        secret already due to stop sooner keeps its earlier date; `0` is now).
+        The body may be empty. Tier A (`principal.secret_added`).
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/PrincipalId" }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                expires_in_secs: { type: integer, minimum: 1, description: When the new secret stops working. Default never. }
+                expire_old_in_secs: { type: integer, minimum: 0, description: Date the older live secrets this far from now. Default leave them valid. }
+      responses:
+        "201":
+          description: Added. Store the secret now.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AddedSecret" }
+        "400":
+          description: "`bad_request` or `expiry_out_of_range`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "404":
+          description: "`unknown_principal`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/principals/{principal_id}/secrets/{secret_id}:
+    delete:
+      tags: [issuer]
+      summary: Revoke one secret.
+      description: Takes effect on the next request. Tier A (`principal.secret_revoked`).
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/PrincipalId" }
+        - { name: secret_id, in: path, required: true, schema: { type: string, example: sps_0123456789abcdef } }
+      responses:
+        "204": { description: Revoked. }
+        "404":
+          description: "`unknown_secret`. No live secret with that id on that principal."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/user-grants:
+    get:
+      tags: [issuer]
+      summary: List user grants.
+      description: Live and revoked, at most 64.
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { name: tenant, in: query, required: false, schema: { $ref: "#/components/schemas/Slug" } }
+        - { name: sub, in: query, required: false, description: The identity provider subject, schema: { type: string } }
+      responses:
+        "200":
+          description: The grants.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/UserGrant" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+    post:
+      tags: [issuer]
+      summary: Grant a person a tenant, roles and indexes.
+      description: |
+        What `POST /session/token` stamps into that person's tokens. A revoked
+        grant is revived in place when created again; a live one is a 409. A
+        tenant slug that does not exist yet is created in the same transaction.
+        Tier A (`user_grant.created`).
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sub, roles]
+              properties:
+                sub: { type: string, minLength: 1, maxLength: 256, description: The identity provider subject. }
+                tenant: { allOf: [{ $ref: "#/components/schemas/Slug" }], default: default }
+                roles: { $ref: "#/components/schemas/Words" }
+                indexes: { allOf: [{ $ref: "#/components/schemas/Words" }], description: 'Default `["*"]`: every index of the tenant.' }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserGrant" }
+        "400":
+          description: "`bad_request`, `invalid_sub`, `invalid_tenant`, `invalid_roles` or `invalid_indexes`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "409":
+          description: "`grant_exists` (a live grant) or `tenant_disabled`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/user-grants/{sub}/{tenant}:
+    delete:
+      tags: [issuer]
+      summary: Revoke a user grant.
+      description: |
+        Stops new user tokens for that person on that tenant. Note that a person
+        whose every grant was revoked is **not** given the single-tenant default.
+        Tier A (`user_grant.revoked`).
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { name: sub, in: path, required: true, description: "Percent-encode it (subjects often contain `|` or `/`).", schema: { type: string } }
+        - { name: tenant, in: path, required: true, schema: { $ref: "#/components/schemas/Slug" } }
+      responses:
+        "204": { description: Revoked. }
+        "404":
+          description: "`unknown_grant`. No live grant for that pair."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/signing-keys:
+    get:
+      tags: [issuer]
+      summary: List signing keys.
+      description: |
+        Newest first, with a state derived from the clock: `pending` (published,
+        not signing yet), `signing`, `published` (older, still verifying),
+        `retired` (past its end date, no longer published) or `removed`. Public
+        keys only; the seed is never returned.
+      security: [{ adminApiKey: [] }]
+      responses:
+        "200":
+          description: The keys.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SigningKey" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/signing-keys/rotate:
+    post:
+      tags: [issuer]
+      summary: Rotate the signing key.
+      description: |
+        Adds a key that starts signing after `activate_in_secs` (default a day,
+        at most 30 days), so verifiers that refresh hourly have it long before a
+        token carries it. The previous key stays published until the longest
+        token it signed has expired plus the clock allowance.
+
+        **`activate_in_secs: 0` is the emergency form.** The new key signs now and
+        every older key is unpublished now: outstanding tokens stop verifying, and
+        verifiers reject new tokens until they next refresh their key set. The
+        response says so in `note`. The CLI `session-broker rotate-signing-key
+        [--now]` does the same against a stopped broker. Tier A
+        (`signing_key.rotated`). The body may be empty.
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                activate_in_secs: { type: integer, minimum: 0, maximum: 2592000 }
+      responses:
+        "201":
+          description: Rotated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Rotation" }
+        "400":
+          description: "`bad_request` or `activate_in_out_of_range`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "500":
+          description: "`store_error`. The new key could not be stored, so nothing was rotated."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "501":
+          description: "`lane_disabled`. The issuer is not configured (or its keys could not be loaded at start), or there is no admin key."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
 
   /admin/audit:
     get:
@@ -618,6 +1303,28 @@ components:
         session for a token, and sharing them would let every backend service
         issue credentials for itself.
 
+    principalSecret:
+      type: http
+      scheme: basic
+      description: |
+        A service principal's id and secret (`sp_…` : `sbp_…`), accepted ONLY by
+        `POST /auth/token`. The same pair may instead be sent as `client_id` and
+        `client_secret` form fields. It opens nothing else: not `/internal/token`,
+        not `/authz`, not `/admin/*`.
+
+  parameters:
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: The `ETag` of the caller's copy. A match gives 304 and no body.
+      schema: { type: string }
+    PrincipalId:
+      name: principal_id
+      in: path
+      required: true
+      schema: { type: string, example: sp_a1b2c3d4e5f6g7h8 }
+
   responses:
     AdminUnauthorised:
       description: "`unauthorised` — a valid admin API key is required."
@@ -793,8 +1500,8 @@ components:
       type: object
       description: The public lane's error shape.
       properties:
-        code: { type: string }
-        message: { type: string }
+        error: { type: string, description: A stable machine-readable code. Clients branch on this. }
+        detail: { type: string }
         login_url:
           type: [string, "null"]
           description: Where to send the browser to re-authenticate, so the SDK never builds one itself.
@@ -808,6 +1515,225 @@ components:
           type: string
           description: A stable machine-readable code. Clients should branch on this, not on the status alone.
         detail: { type: string }
+
+    Slug:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+      example: acme
+
+    Words:
+      type: array
+      minItems: 1
+      maxItems: 64
+      items: { type: string, minLength: 1, maxLength: 128, pattern: '^\S+$' }
+      description: Each item 1 to 128 characters, no whitespace or control characters.
+
+    TokenResponse:
+      type: object
+      description: RFC 6749 section 5.1.
+      required: [access_token, token_type, expires_in, scope]
+      properties:
+        access_token:
+          type: string
+          description: |
+            A compact JWS. Header `{"alg":"EdDSA","typ":"JWT","kid"}`. Claims, in
+            this order: `iss`, `sub` (the principal id), `aud` (one string), `exp`,
+            `iat`, `jti`, `tenant`, `kind`, `name`, `scopes`, `indexes`. No `nbf`.
+            See `docs/verifier/README.md`.
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer, description: "Seconds. Default is the issuer's machine lifetime, lowered to the principal's maximum." }
+        scope: { type: string, description: "The granted scopes, space-separated." }
+
+    UserTokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in, tenant, roles, indexes]
+      properties:
+        access_token:
+          type: string
+          description: |
+            A compact JWS. Header `{"alg":"EdDSA","typ":"JWT","kid"}`. Claims, in
+            this order: `iss`, `sub` (the identity provider subject), `sid` (the
+            broker session id), `aud`, `exp`, `iat`, `jti`, `kind` (`user`),
+            `tenant`, `roles`, `indexes`. See `docs/verifier/README.md`.
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer }
+        tenant: { type: string }
+        roles: { type: array, items: { type: string } }
+        indexes: { type: array, items: { type: string } }
+
+    OAuthError:
+      type: object
+      description: RFC 6749 section 5.2. `/auth/token` uses this shape rather than the broker's own, so OAuth client libraries understand it.
+      required: [error, error_description]
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - unsupported_grant_type
+            - invalid_client
+            - invalid_scope
+            - unauthorized_client
+            - rate_limited
+            - temporarily_unavailable
+        error_description: { type: string }
+
+    JwkSet:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            required: [kty, crv, kid, x, use, alg]
+            properties:
+              kty: { type: string, const: OKP }
+              crv: { type: string, const: Ed25519 }
+              kid: { type: string, description: "base64url(SHA-256(public key)[..8]), 11 characters." }
+              x: { type: string, description: "The public key, base64url." }
+              use: { type: string, const: sig }
+              alg: { type: string, const: EdDSA }
+
+    IssuerMetadata:
+      type: object
+      description: RFC 8414, with only what exists.
+      required: [issuer, jwks_uri, token_endpoint, grant_types_supported, token_endpoint_auth_methods_supported, response_types_supported]
+      properties:
+        issuer: { type: string, description: The configured `token_issuer`; the `iss` of every token. }
+        jwks_uri: { type: string }
+        token_endpoint: { type: string }
+        grant_types_supported: { type: array, items: { type: string }, example: [client_credentials] }
+        token_endpoint_auth_methods_supported: { type: array, items: { type: string }, example: [client_secret_post, client_secret_basic] }
+        response_types_supported: { type: array, items: { type: string }, example: [token] }
+
+    Tenant:
+      type: object
+      required: [tenant, created_at, live]
+      properties:
+        tenant: { $ref: "#/components/schemas/Slug" }
+        display_name: { type: [string, "null"] }
+        created_at: { type: integer }
+        disabled_at: { type: [integer, "null"] }
+        live: { type: boolean, description: Derived from `disabled_at`. }
+
+    NewPrincipal:
+      type: object
+      additionalProperties: false
+      required: [name, kind, scopes, audience]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128, description: "Unique within the tenant, and reserved for good: a revoked principal keeps its name." }
+        tenant: { allOf: [{ $ref: "#/components/schemas/Slug" }], default: default }
+        kind: { type: string, enum: [ingest, node, replica, reader, admin] }
+        scopes: { $ref: "#/components/schemas/Words" }
+        indexes: { allOf: [{ $ref: "#/components/schemas/Words" }], description: 'Default `["*"]`: every index of the tenant.' }
+        audience: { type: string, minLength: 1, maxLength: 128, example: logless }
+        max_ttl_secs:
+          type: integer
+          minimum: 1
+          maximum: 31536000
+          default: 2592000
+          description: The longest token lifetime this principal may ask for (the issuer's own maximum also applies).
+        expires_in_secs: { type: integer, minimum: 1, description: When the first secret stops working. Default never. }
+
+    Principal:
+      type: object
+      required: [principal_id, tenant, name, kind, scopes, indexes, audience, max_ttl_secs, created_at, live]
+      properties:
+        principal_id: { type: string, example: sp_a1b2c3d4e5f6g7h8 }
+        tenant: { type: string }
+        name: { type: string }
+        kind: { type: string, enum: [ingest, node, replica, reader, admin] }
+        scopes: { type: array, items: { type: string } }
+        indexes: { type: array, items: { type: string } }
+        audience: { type: string }
+        max_ttl_secs: { type: integer }
+        created_at: { type: integer }
+        created_by: { type: [string, "null"] }
+        last_used_at: { type: [integer, "null"], description: "Written at most once a minute per principal. Answers: is anything still using this, before an operator revokes?" }
+        revoked_at: { type: [integer, "null"] }
+        live: { type: boolean, description: Derived from `revoked_at`. }
+
+    PrincipalSecret:
+      type: object
+      required: [secret_id, created_at, live]
+      properties:
+        secret_id: { type: string, example: sps_0123456789abcdef }
+        created_at: { type: integer }
+        expires_at: { type: [integer, "null"], description: Null means it does not expire. }
+        revoked_at: { type: [integer, "null"] }
+        live: { type: boolean, description: Not revoked and not past `expires_at`. }
+
+    PrincipalDetail:
+      allOf:
+        - $ref: "#/components/schemas/Principal"
+        - type: object
+          required: [secrets]
+          properties:
+            secrets:
+              type: array
+              items: { $ref: "#/components/schemas/PrincipalSecret" }
+
+    IssuedSecret:
+      type: object
+      required: [secret_id, secret, created_at]
+      properties:
+        secret_id: { type: string }
+        secret: { type: string, example: sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx, description: "`sbp_` plus 32 random bytes, base64url. Shown once. Not recoverable." }
+        created_at: { type: integer }
+        expires_at: { type: [integer, "null"] }
+
+    CreatedPrincipal:
+      allOf:
+        - $ref: "#/components/schemas/Principal"
+        - type: object
+          required: [secret]
+          properties:
+            secret: { $ref: "#/components/schemas/IssuedSecret" }
+
+    AddedSecret:
+      allOf:
+        - $ref: "#/components/schemas/IssuedSecret"
+        - type: object
+          required: [principal_id]
+          properties:
+            principal_id: { type: string }
+            old_secrets_expire_at: { type: [integer, "null"], description: "When the older secrets stop working, if the request asked for that." }
+
+    UserGrant:
+      type: object
+      required: [sub, tenant, roles, indexes, created_at, live]
+      properties:
+        sub: { type: string }
+        tenant: { type: string }
+        roles: { type: array, items: { type: string } }
+        indexes: { type: array, items: { type: string } }
+        created_at: { type: integer }
+        created_by: { type: [string, "null"] }
+        revoked_at: { type: [integer, "null"] }
+        live: { type: boolean }
+
+    SigningKey:
+      type: object
+      required: [kid, x, created_at, activate_at, state]
+      properties:
+        kid: { type: string }
+        x: { type: string, description: "The public key, base64url, as published in the JWK Set. Never the seed." }
+        created_at: { type: integer }
+        activate_at: { type: integer, description: When it starts signing. }
+        retire_at: { type: [integer, "null"], description: When it stops being published. Null means open-ended. }
+        removed_at: { type: [integer, "null"] }
+        state: { type: string, enum: [pending, signing, published, retired, removed] }
+
+    Rotation:
+      type: object
+      required: [kid, activate_at, previous_retire_at, immediate, note]
+      properties:
+        kid: { type: string, description: The new key. }
+        activate_at: { type: integer }
+        previous_retire_at: { type: integer, description: When the keys before it stop being published. }
+        immediate: { type: boolean, description: True for a zero-lead rotation. }
+        note: { type: string, description: "What the operator should expect to happen next, in words." }
 
 security:
   - sessionCookie: []

@@ -71,3 +71,37 @@ Recorded so these are choices, not gaps. None of the vendors above ships them by
 - An issued token cannot be revoked before it expires. Revoking a principal, a secret or a grant
   stops new tokens at once; outstanding ones live out their lifetime (an hour by default).
 - Losing the custody keyfile loses the signing keys as well as the upstream tokens.
+
+## Addendum: adopted from the consultant's second pass (binding for S2 onward)
+
+The consultant revised the design after the owner's steer (`token-issuer-v2-pragmatic.md`). S1 keeps
+the first design (signing seed sealed in the store, created at first boot). From S2 onward these
+simpler choices apply, and they win over `token-issuer.md` and over anything above that conflicts:
+
+- **No tenant step.** The `tenant` table from S1 stays, but nobody has to create a tenant: creating
+  a principal or a user grant with a tenant slug inserts the tenant row if it is missing, in the
+  same transaction. Slug rule `^[a-z0-9][a-z0-9-]{0,62}$`. `default` is pre-seeded.
+- **One audience per consumer product**, not per component: for log-less it is `logless` for the
+  agent, central and console alike. Deployments are told apart by `iss`.
+- **Secret prefix `sbp_`** on principal secrets (so secret scanners can spot them); ids `sp_`.
+- **Machine tokens:** default lifetime 86400 s (was 3600); per-principal maximum default 30 days,
+  allowed up to 365 days. `POST /auth/token` also accepts HTTP Basic for the client id and secret,
+  and an optional `ttl` no larger than the principal's maximum.
+- **Claim names:** `scopes` and `indexes` as JSON arrays of strings (`["*"]` means every index of
+  the tenant), `roles` an array on user tokens, header `typ: "JWT"`. If S1 fixed other names,
+  rename them in S4; no consumer exists yet.
+- **User tokens on a single-tenant install need no grant.** If the signed-in user has no grant and
+  `default_user_tenant` is set (default `default`), issue for that tenant with `default_user_roles`
+  (default `viewer`) and `indexes: ["*"]`. Setting `default_user_tenant` to empty requires explicit
+  grants.
+- **`/internal/token` is NOT changed.** Drop the `token_type: "broker"` extension from S5; the
+  console calls `POST /session/token`.
+- **Key publication:** `Cache-Control: public, max-age=300, stale-if-error=2592000` and an `ETag`
+  with 304 on `If-None-Match`.
+- **Rate limiting on `/auth/token`:** failures only, using the existing limiter.
+
+Defaults table above is superseded where this addendum differs (machine token lifetime).
+
+**Precedence note for implementers.** Your task prompt was written before this addendum. Where the
+prompt and this addendum disagree (machine token lifetime, claim names, the `/internal/token`
+extension, tenant creation, audience naming), follow this addendum and say so in your report.

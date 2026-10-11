@@ -18,6 +18,7 @@ pub mod clock;
 pub mod config;
 pub mod custody;
 pub mod http;
+pub mod issuer;
 pub mod keepalive;
 pub mod oauth;
 pub mod ratelimit;

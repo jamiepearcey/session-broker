@@ -131,6 +131,7 @@ pub struct Metrics {
     authz_decisions: Family<AtomicU64>,
     session_refresh: Family<AtomicU64>,
     token_exchanges: Family<AtomicU64>,
+    tokens_issued: Family<AtomicU64>,
     session_anomalies: Family<AtomicU64>,
     keepalive_refresh: Family<AtomicU64>,
     keepalive_duration: Histogram,
@@ -186,6 +187,16 @@ impl Metrics {
     pub fn record_token_exchange(&self, outcome: &str) {
         self.token_exchanges
             .get_or_insert(&[outcome], || AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A token the broker signed, or refused to. `kind` is the principal's
+    /// kind (`machine` while the caller is still unidentified); `outcome` is
+    /// `issued` or the refusal code. Never a principal id: that is the audit
+    /// record's job, and it would be one series per principal here.
+    pub fn record_token_issued(&self, kind: &str, outcome: &str) {
+        self.tokens_issued
+            .get_or_insert(&[kind, outcome], || AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -288,6 +299,13 @@ impl Metrics {
             "Upstream token exchanges on /internal/token.",
             &["outcome"],
             &self.token_exchanges,
+        );
+        counter_family(
+            &mut out,
+            "broker_tokens_issued_total",
+            "Tokens signed by the issuer, and refusals to sign one.",
+            &["kind", "outcome"],
+            &self.tokens_issued,
         );
         counter_family(
             &mut out,

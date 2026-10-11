@@ -130,6 +130,11 @@ a breaking change to whatever is alerting on it.
 | `key.revoked` | `admin` | A key is revoked. Effective immediately — the `revoked_at IS NULL` predicate *is* the revocation. |
 | `session.revoked` | `admin` | An operator force-logs-out a session. |
 | `logging.level_changed` | `admin` | Diagnostic verbosity raised or restored, with the deadline in `detail`. Turning the lights down is itself an audited act. |
+| `tenant.created` / `tenant.disabled` / `tenant.enabled` | `admin` | A tenant slug is created, disabled or re-enabled. `key_id` carries the slug. A tenant created implicitly by naming it on a principal or grant rides inside that row's transaction. |
+| `principal.created` / `principal.revoked` | `admin` | A service principal is created (with its first secret) or revoked. `key_id` carries the `sp_` id; never a secret. |
+| `principal.secret_added` / `principal.secret_revoked` | `admin` | A principal secret is added or revoked. `key_id` carries the principal id; `detail` the secret id. |
+| `user_grant.created` / `user_grant.revoked` | `admin` | A user grant is created (or revived) or revoked. `subject` carries the `sub`. |
+| `signing_key.created` / `signing_key.rotated` / `signing_key.removed` | `system` / `admin` / `system` | A signing key is created at first boot, rotated by an operator, or removed after its retire date. `key_id` carries the `kid`; never the seed. |
 
 ### Tier B — batched, fail-open, depth-bounded
 
@@ -140,6 +145,8 @@ a breaking change to whatever is alerting on it.
 | `login.failed` | `anonymous` | Callback validation fails — bad `state`, bad `nonce`, expired txn, IdP error. `reason` carries which. Audited even for unknown subjects. |
 | `token.exchanged` | `backend` | `/internal/token` hands a backend the upstream token. Coalesced per `(key_id, sid)`. |
 | `token.refused` | `backend` | `/internal/token` refuses. Never coalesced. |
+| `token.issued` | `backend` / `user` | `POST /auth/token` or `POST /session/token` signs a token. `detail` carries `{aud, kind, tenant, kid, jti, ttl}`; never the token. Coalesced per (principal or subject, audience). |
+| `token.issuance_refused` | `backend` / `user` | Issuance refuses. `reason` is the error code. Never coalesced. A request naming no credential, a 429 and a 503 are counted in the metric only. |
 | `custody.degraded` | `system` | Keepalive failed and the grant moved off `ok`. |
 | `custody.dead` | `system` | The refresh token will never work again. |
 | `custody.revoked_upstream` | `system` | The IdP revoked the grant; `detail` carries the `on_upstream_revoked` policy applied. |
@@ -197,6 +204,7 @@ it.
 - `broker_authz_decisions_total{decision,reason}` — the platform's per-request lane
 - `broker_session_refresh_total{outcome}` — `rotated|coalesced|reused|refused`
 - `broker_token_exchanges_total{outcome}`
+- `broker_tokens_issued_total{kind,outcome}` — `kind` is the principal's kind, `user`, or `machine` before the caller is known; `outcome` is `issued` or the error code
 - `broker_session_anomalies_total{kind}`
 
 **Background work**

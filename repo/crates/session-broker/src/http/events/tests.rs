@@ -197,6 +197,7 @@ fn harness() -> (axum::Router, Arc<SessionMap>, TestClock) {
         audit: None,
         metrics: crate::telemetry::Metrics::new(),
         rate_limit: None,
+        issuer: None,
     };
     let router = super::super::router(state).layer(Extension(events));
     (router, sessions, clock)
