@@ -49,6 +49,86 @@ export interface IssuedKey {
   created_at: number;
 }
 
+export interface Tenant {
+  tenant: string;
+  display_name: string | null;
+  created_at: number;
+  disabled_at: number | null;
+  live: boolean;
+}
+
+export interface Principal {
+  principal_id: string;
+  tenant: string;
+  name: string;
+  kind: "ingest" | "node" | "replica" | "reader" | "admin";
+  scopes: string[];
+  indexes: string[];
+  audience: string;
+  max_ttl_secs: number;
+  created_at: number;
+  created_by: string | null;
+  last_used_at: number | null;
+  revoked_at: number | null;
+  live: boolean;
+}
+
+export interface PrincipalSecret {
+  secret_id: string;
+  created_at: number;
+  expires_at: number | null;
+  revoked_at: number | null;
+  live: boolean;
+}
+
+export interface PrincipalDetail extends Principal {
+  secrets: PrincipalSecret[];
+}
+
+/** A secret as returned by the call that made it. `secret` is shown exactly once. */
+export interface IssuedSecret {
+  secret_id: string;
+  secret: string;
+  created_at: number;
+  expires_at: number | null;
+}
+
+export interface NewPrincipal {
+  name: string;
+  /** Defaults to `default`; created if nobody has used it yet. */
+  tenant?: string;
+  kind: Principal["kind"];
+  scopes: string[];
+  /** Defaults to `["*"]`. */
+  indexes?: string[];
+  audience: string;
+  max_ttl_secs?: number;
+  /** When the first secret stops working. Default: never. */
+  expires_in_secs?: number;
+}
+
+export interface UserGrant {
+  sub: string;
+  tenant: string;
+  roles: string[];
+  indexes: string[];
+  created_at: number;
+  created_by: string | null;
+  revoked_at: number | null;
+  live: boolean;
+}
+
+export interface SigningKey {
+  kid: string;
+  /** The public key, base64url, as in the JWK Set. */
+  x: string;
+  created_at: number;
+  activate_at: number;
+  retire_at: number | null;
+  removed_at: number | null;
+  state: "pending" | "signing" | "published" | "retired" | "removed";
+}
+
 /** One row of the durable audit record (ADR-0015). */
 export interface AuditRow {
   seq: number;
@@ -192,6 +272,46 @@ export const adminApi = {
   revokeSession: (sid: string) =>
     call<void>(`/sessions/${encodeURIComponent(sid)}`, { method: "DELETE" }),
   custody: () => call<Custody[]>("/custody"),
+  tenants: () => call<Tenant[]>("/tenants"),
+  createTenant: (tenant: string, displayName?: string) =>
+    call<Tenant>("/tenants", {
+      method: "POST",
+      body: JSON.stringify({ tenant, display_name: displayName }),
+    }),
+  disableTenant: (tenant: string) =>
+    call<void>(`/tenants/${encodeURIComponent(tenant)}`, { method: "DELETE" }),
+  principals: (tenant?: string) =>
+    call<Principal[]>(`/principals${tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""}`),
+  principal: (principalId: string) =>
+    call<PrincipalDetail>(`/principals/${encodeURIComponent(principalId)}`),
+  createPrincipal: (body: NewPrincipal) =>
+    call<Principal & { secret: IssuedSecret }>("/principals", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  revokePrincipal: (principalId: string) =>
+    call<void>(`/principals/${encodeURIComponent(principalId)}`, { method: "DELETE" }),
+  addPrincipalSecret: (
+    principalId: string,
+    options: { expires_in_secs?: number; expire_old_in_secs?: number } = {},
+  ) =>
+    call<IssuedSecret & { principal_id: string; old_secrets_expire_at: number | null }>(
+      `/principals/${encodeURIComponent(principalId)}/secrets`,
+      { method: "POST", body: JSON.stringify(options) },
+    ),
+  revokePrincipalSecret: (principalId: string, secretId: string) =>
+    call<void>(
+      `/principals/${encodeURIComponent(principalId)}/secrets/${encodeURIComponent(secretId)}`,
+      { method: "DELETE" },
+    ),
+  userGrants: () => call<UserGrant[]>("/user-grants"),
+  createUserGrant: (grant: { sub: string; tenant?: string; roles: string[]; indexes?: string[] }) =>
+    call<UserGrant>("/user-grants", { method: "POST", body: JSON.stringify(grant) }),
+  revokeUserGrant: (sub: string, tenant: string) =>
+    call<void>(`/user-grants/${encodeURIComponent(sub)}/${encodeURIComponent(tenant)}`, {
+      method: "DELETE",
+    }),
+  signingKeys: () => call<SigningKey[]>("/signing-keys"),
   audit: (filters: AuditFilters = {}) => call<AuditPage>(`/audit${auditQuery(filters)}`),
   observability: () => call<Observability>("/observability"),
   setLogLevel: (filter: string, durationSecs: number) =>

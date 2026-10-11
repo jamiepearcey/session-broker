@@ -121,6 +121,59 @@ pub enum AdminWrite {
         kid: String,
         now: Timestamp,
     },
+    InsertTenant {
+        tenant_id: String,
+        display_name: Option<String>,
+        now: Timestamp,
+    },
+    DisableTenant {
+        tenant_id: String,
+        now: Timestamp,
+    },
+    /// A principal with its first secret, and its tenant if that is new.
+    InsertPrincipal {
+        principal: repo::NewPrincipal,
+        now: Timestamp,
+    },
+    RevokePrincipal {
+        principal_id: String,
+        now: Timestamp,
+    },
+    /// A further secret. `expire_others_at` dates the principal's older live
+    /// secrets; `None` leaves them valid until somebody revokes them.
+    AddPrincipalSecret {
+        principal_id: String,
+        secret: repo::NewSecret,
+        expire_others_at: Option<Timestamp>,
+        now: Timestamp,
+    },
+    RevokePrincipalSecret {
+        principal_id: String,
+        secret_id: String,
+        now: Timestamp,
+    },
+    InsertUserGrant {
+        grant: repo::NewUserGrant,
+        now: Timestamp,
+    },
+    RevokeUserGrant {
+        sub: String,
+        tenant_id: String,
+        now: Timestamp,
+    },
+}
+
+impl AdminWrite {
+    /// Why an unapplied write (`Ok(false)`) did nothing, for its audit row: a
+    /// create ran into something already there, anything else found nothing.
+    fn unapplied_reason(&self) -> &'static str {
+        match self {
+            AdminWrite::InsertTenant { .. }
+            | AdminWrite::InsertPrincipal { .. }
+            | AdminWrite::InsertUserGrant { .. } => "conflict",
+            _ => "not_found",
+        }
+    }
 }
 
 /// Write-behind mutations: session/generation/txn housekeeping. Enqueued and
@@ -534,6 +587,7 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                     }
                 }
                 Command::Admin(write, audit, ack) => {
+                    let unapplied_reason = write.unapplied_reason();
                     let outcome = match write {
                         AdminWrite::InsertApiKey {
                             key_id,
@@ -569,6 +623,45 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                         AdminWrite::RemoveRetiredSigningKey { kid, now } => {
                             repo::remove_retired_signing_key(&tx, &kid, now)
                         }
+                        AdminWrite::InsertTenant {
+                            tenant_id,
+                            display_name,
+                            now,
+                        } => repo::insert_tenant(&tx, &tenant_id, display_name.as_deref(), now),
+                        AdminWrite::DisableTenant { tenant_id, now } => {
+                            repo::disable_tenant(&tx, &tenant_id, now)
+                        }
+                        AdminWrite::InsertPrincipal { principal, now } => {
+                            repo::insert_principal(&tx, &principal, now)
+                        }
+                        AdminWrite::RevokePrincipal { principal_id, now } => {
+                            repo::revoke_principal(&tx, &principal_id, now)
+                        }
+                        AdminWrite::AddPrincipalSecret {
+                            principal_id,
+                            secret,
+                            expire_others_at,
+                            now,
+                        } => repo::add_principal_secret(
+                            &tx,
+                            &principal_id,
+                            &secret,
+                            expire_others_at,
+                            now,
+                        ),
+                        AdminWrite::RevokePrincipalSecret {
+                            principal_id,
+                            secret_id,
+                            now,
+                        } => repo::revoke_principal_secret(&tx, &principal_id, &secret_id, now),
+                        AdminWrite::InsertUserGrant { grant, now } => {
+                            repo::insert_user_grant(&tx, &grant, now)
+                        }
+                        AdminWrite::RevokeUserGrant {
+                            sub,
+                            tenant_id,
+                            now,
+                        } => repo::revoke_user_grant(&tx, &sub, &tenant_id, now),
                     }?;
 
                     // Tier A: same transaction as the mutation, so there is no
@@ -581,7 +674,7 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                     if let Some(mut row) = audit {
                         if !outcome {
                             row.outcome = "failure".to_owned();
-                            row.reason = Some("not_found".to_owned());
+                            row.reason = Some(unapplied_reason.to_owned());
                         }
                         repo::insert_audit(&tx, &row)?;
                     }

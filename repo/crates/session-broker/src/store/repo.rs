@@ -615,6 +615,472 @@ pub(crate) fn reseal_signing_keys_with(
     Ok(report)
 }
 
+// ---------------------------------------------------------------------
+// tenant / principal / principal_secret / user_grant (v5) — the token
+// issuer's identities, as data
+//
+// Nothing here is reachable from `/internal/token` or `/authz`: a principal is
+// never an `api_key`. Every mutation returns whether it changed a row, so the
+// admin lane can answer 404/409 and the audit row can say the same thing.
+// ---------------------------------------------------------------------
+
+/// A tenant as the admin lane sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRow {
+    pub tenant_id: String,
+    pub display_name: Option<String>,
+    pub created_at: Timestamp,
+    pub disabled_at: Option<Timestamp>,
+}
+
+pub fn list_tenants(conn: &Connection) -> Result<Vec<TenantRow>, RepoError> {
+    let mut stmt = conn.prepare(
+        "SELECT tenant_id, display_name, created_at, disabled_at
+         FROM tenant ORDER BY tenant_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(TenantRow {
+            tenant_id: r.get(0)?,
+            display_name: r.get(1)?,
+            created_at: Timestamp(r.get(2)?),
+            disabled_at: r.get::<_, Option<i64>>(3)?.map(Timestamp),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(RepoError::from)
+}
+
+/// False if the tenant already exists, disabled or not.
+pub fn insert_tenant(
+    conn: &Connection,
+    tenant_id: &str,
+    display_name: Option<&str>,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO tenant (tenant_id, display_name, created_at) VALUES (?1, ?2, ?3)",
+        params![tenant_id, display_name, now.secs()],
+    )?;
+    Ok(changed > 0)
+}
+
+/// False if the tenant is unknown or already disabled.
+pub fn disable_tenant(
+    conn: &Connection,
+    tenant_id: &str,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "UPDATE tenant SET disabled_at = ?1 WHERE tenant_id = ?2 AND disabled_at IS NULL",
+        params![now.secs(), tenant_id],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn tenant_is_disabled(conn: &Connection, tenant_id: &str) -> Result<bool, RepoError> {
+    let disabled: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT disabled_at FROM tenant WHERE tenant_id = ?1",
+            params![tenant_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(matches!(disabled, Some(Some(_))))
+}
+
+/// Make sure `tenant_id` exists, creating it if nobody has, and report whether
+/// it is enabled. Naming a tenant is all it takes to have one; a disabled one
+/// is not resurrected by being named again.
+fn ensure_tenant(conn: &Connection, tenant_id: &str, now: Timestamp) -> Result<bool, RepoError> {
+    insert_tenant(conn, tenant_id, None, now)?;
+    Ok(!tenant_is_disabled(conn, tenant_id)?)
+}
+
+/// A principal secret on its way to the store. Only the hash is kept.
+pub struct NewSecret {
+    pub secret_id: String,
+    pub hash: Vec<u8>,
+    pub expires_at: Option<Timestamp>,
+}
+
+impl std::fmt::Debug for NewSecret {
+    // Rides inside `AdminWrite`, which derives `Debug` (INV-12).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewSecret")
+            .field("secret_id", &self.secret_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub struct NewPrincipal {
+    pub principal_id: String,
+    pub tenant_id: String,
+    pub name: String,
+    pub kind: String,
+    pub scopes: Vec<String>,
+    pub indexes: Vec<String>,
+    pub audience: String,
+    pub max_ttl_secs: u64,
+    pub created_by: Option<String>,
+    /// A principal is born with its first secret, in the same transaction.
+    pub secret: NewSecret,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalRow {
+    pub principal_id: String,
+    pub tenant_id: String,
+    pub name: String,
+    pub kind: String,
+    pub scopes: Vec<String>,
+    pub indexes: Vec<String>,
+    pub audience: String,
+    pub max_ttl_secs: u64,
+    pub created_at: Timestamp,
+    pub created_by: Option<String>,
+    pub last_used_at: Option<Timestamp>,
+    pub revoked_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRow {
+    pub secret_id: String,
+    pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
+    pub revoked_at: Option<Timestamp>,
+}
+
+impl SecretRow {
+    /// The same rule [`find_live_principal_by_secret`] applies in SQL, so a
+    /// listing and the token lane cannot disagree about what "live" means.
+    pub fn live_at(&self, now: Timestamp) -> bool {
+        self.revoked_at.is_none() && self.expires_at.is_none_or(|at| at > now)
+    }
+}
+
+const PRINCIPAL_COLUMNS: &str = "p.principal_id, p.tenant_id, p.name, p.kind, p.scope, p.indexes, \
+     p.audience, p.max_ttl_secs, p.created_at, p.created_by, p.last_used_at, p.revoked_at";
+
+fn json_list(raw: String, column: &str) -> Result<Vec<String>, RepoError> {
+    serde_json::from_str(&raw)
+        .map_err(|e| RepoError::Corrupt(format!("{column} is not a JSON array of strings: {e}")))
+}
+
+fn principal_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PrincipalRow, RepoError>> {
+    let scope: String = r.get(4)?;
+    let indexes: String = r.get(5)?;
+    let max_ttl: i64 = r.get(7)?;
+    Ok((|| -> Result<PrincipalRow, RepoError> {
+        Ok(PrincipalRow {
+            principal_id: r.get(0)?,
+            tenant_id: r.get(1)?,
+            name: r.get(2)?,
+            kind: r.get(3)?,
+            scopes: json_list(scope, "principal.scope")?,
+            indexes: json_list(indexes, "principal.indexes")?,
+            audience: r.get(6)?,
+            max_ttl_secs: max_ttl.max(0) as u64,
+            created_at: Timestamp(r.get(8)?),
+            created_by: r.get(9)?,
+            last_used_at: r.get::<_, Option<i64>>(10)?.map(Timestamp),
+            revoked_at: r.get::<_, Option<i64>>(11)?.map(Timestamp),
+        })
+    })())
+}
+
+fn insert_secret(
+    conn: &Connection,
+    principal_id: &str,
+    secret: &NewSecret,
+    now: Timestamp,
+) -> Result<(), RepoError> {
+    conn.execute(
+        "INSERT INTO principal_secret (secret_id, principal_id, secret_hash, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            secret.secret_id,
+            principal_id,
+            secret.hash,
+            now.secs(),
+            secret.expires_at.map(Timestamp::secs),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Create a principal and its first secret, creating the tenant if it is
+/// missing. False if the tenant is disabled or the tenant already has a
+/// principal of that name (revoked ones keep their name).
+pub fn insert_principal(
+    conn: &Connection,
+    p: &NewPrincipal,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    if !ensure_tenant(conn, &p.tenant_id, now)? {
+        return Ok(false);
+    }
+    let inserted = conn.execute(
+        "INSERT INTO principal (principal_id, tenant_id, name, kind, scope, indexes, audience,
+                                max_ttl_secs, created_at, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT (tenant_id, name) DO NOTHING",
+        params![
+            p.principal_id,
+            p.tenant_id,
+            p.name,
+            p.kind,
+            serde_json::to_string(&p.scopes).map_err(|e| RepoError::Corrupt(e.to_string()))?,
+            serde_json::to_string(&p.indexes).map_err(|e| RepoError::Corrupt(e.to_string()))?,
+            p.audience,
+            p.max_ttl_secs as i64,
+            now.secs(),
+            p.created_by,
+        ],
+    )?;
+    if inserted == 0 {
+        return Ok(false);
+    }
+    insert_secret(conn, &p.principal_id, &p.secret, now)?;
+    Ok(true)
+}
+
+/// Every principal, newest first, optionally of one tenant.
+pub fn list_principals(
+    conn: &Connection,
+    tenant_id: Option<&str>,
+) -> Result<Vec<PrincipalRow>, RepoError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PRINCIPAL_COLUMNS} FROM principal p
+         WHERE (?1 IS NULL OR p.tenant_id = ?1)
+         ORDER BY p.created_at DESC, p.rowid DESC"
+    ))?;
+    let rows = stmt.query_map(params![tenant_id], principal_row)?;
+    rows.map(|r| r.map_err(RepoError::from).and_then(std::convert::identity))
+        .collect()
+}
+
+pub fn get_principal(
+    conn: &Connection,
+    principal_id: &str,
+) -> Result<Option<PrincipalRow>, RepoError> {
+    conn.query_row(
+        &format!("SELECT {PRINCIPAL_COLUMNS} FROM principal p WHERE p.principal_id = ?1"),
+        params![principal_id],
+        principal_row,
+    )
+    .optional()?
+    .transpose()
+}
+
+/// Every secret of a principal, newest first. Hashes stay in the store.
+pub fn list_principal_secrets(
+    conn: &Connection,
+    principal_id: &str,
+) -> Result<Vec<SecretRow>, RepoError> {
+    let mut stmt = conn.prepare(
+        "SELECT secret_id, created_at, expires_at, revoked_at FROM principal_secret
+         WHERE principal_id = ?1 ORDER BY created_at DESC, rowid DESC",
+    )?;
+    let rows = stmt.query_map(params![principal_id], |r| {
+        Ok(SecretRow {
+            secret_id: r.get(0)?,
+            created_at: Timestamp(r.get(1)?),
+            expires_at: r.get::<_, Option<i64>>(2)?.map(Timestamp),
+            revoked_at: r.get::<_, Option<i64>>(3)?.map(Timestamp),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(RepoError::from)
+}
+
+/// False if the principal is unknown or already revoked.
+pub fn revoke_principal(
+    conn: &Connection,
+    principal_id: &str,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "UPDATE principal SET revoked_at = ?1 WHERE principal_id = ?2 AND revoked_at IS NULL",
+        params![now.secs(), principal_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Add a secret to a live principal. The principal's other secrets stay valid
+/// untouched; only when `expire_others_at` is given are they dated, and only
+/// the ones that would otherwise outlive that date — a secret already due to
+/// expire sooner keeps its earlier date. False if the principal is unknown or
+/// revoked.
+pub fn add_principal_secret(
+    conn: &Connection,
+    principal_id: &str,
+    secret: &NewSecret,
+    expire_others_at: Option<Timestamp>,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let live: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM principal WHERE principal_id = ?1 AND revoked_at IS NULL",
+            params![principal_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if live.is_none() {
+        return Ok(false);
+    }
+    if let Some(at) = expire_others_at {
+        // Before the insert, so the new secret is not among "the others".
+        conn.execute(
+            "UPDATE principal_secret SET expires_at = ?1
+             WHERE principal_id = ?2 AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?1)",
+            params![at.secs(), principal_id],
+        )?;
+    }
+    insert_secret(conn, principal_id, secret, now)?;
+    Ok(true)
+}
+
+/// False if the secret is not one of this principal's, or already revoked.
+pub fn revoke_principal_secret(
+    conn: &Connection,
+    principal_id: &str,
+    secret_id: &str,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "UPDATE principal_secret SET revoked_at = ?1
+         WHERE secret_id = ?2 AND principal_id = ?3 AND revoked_at IS NULL",
+        params![now.secs(), secret_id, principal_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Resolve a presented secret's hash to the principal it authenticates.
+///
+/// Four terms, each a way a still-stored secret stops working: the secret is
+/// revoked, the secret has passed its `expires_at`, the principal is revoked,
+/// the tenant is disabled. `now` comes from the caller's `Clock`.
+pub fn find_live_principal_by_secret(
+    conn: &Connection,
+    secret_hash: &[u8],
+    now: Timestamp,
+) -> Result<Option<PrincipalRow>, RepoError> {
+    conn.query_row(
+        &format!(
+            "SELECT {PRINCIPAL_COLUMNS}
+             FROM principal_secret s
+             JOIN principal p ON p.principal_id = s.principal_id
+             JOIN tenant t ON t.tenant_id = p.tenant_id
+             WHERE s.secret_hash = ?1
+               AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at > ?2)
+               AND p.revoked_at IS NULL
+               AND t.disabled_at IS NULL"
+        ),
+        params![secret_hash, now.secs()],
+        principal_row,
+    )
+    .optional()?
+    .transpose()
+}
+
+#[derive(Debug)]
+pub struct NewUserGrant {
+    pub sub: String,
+    pub tenant_id: String,
+    pub roles: Vec<String>,
+    pub indexes: Vec<String>,
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserGrantRow {
+    pub sub: String,
+    pub tenant_id: String,
+    pub roles: Vec<String>,
+    pub indexes: Vec<String>,
+    pub created_at: Timestamp,
+    pub created_by: Option<String>,
+    pub revoked_at: Option<Timestamp>,
+}
+
+/// Grant `sub` a tenant, creating the tenant if it is missing. The key is
+/// `(sub, tenant)`, so a revoked grant is brought back to life with the new
+/// roles rather than blocking the pair for good. False if a live grant already
+/// exists or the tenant is disabled.
+pub fn insert_user_grant(
+    conn: &Connection,
+    g: &NewUserGrant,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    if !ensure_tenant(conn, &g.tenant_id, now)? {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "INSERT INTO user_grant (sub, tenant_id, roles, indexes, created_at, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (sub, tenant_id) DO UPDATE SET
+           roles = excluded.roles, indexes = excluded.indexes,
+           created_at = excluded.created_at, created_by = excluded.created_by,
+           revoked_at = NULL
+         WHERE user_grant.revoked_at IS NOT NULL",
+        params![
+            g.sub,
+            g.tenant_id,
+            serde_json::to_string(&g.roles).map_err(|e| RepoError::Corrupt(e.to_string()))?,
+            serde_json::to_string(&g.indexes).map_err(|e| RepoError::Corrupt(e.to_string()))?,
+            now.secs(),
+            g.created_by,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Every grant, newest first, optionally of one tenant and/or one subject.
+pub fn list_user_grants(
+    conn: &Connection,
+    tenant_id: Option<&str>,
+    sub: Option<&str>,
+) -> Result<Vec<UserGrantRow>, RepoError> {
+    let mut stmt = conn.prepare(
+        "SELECT sub, tenant_id, roles, indexes, created_at, created_by, revoked_at
+         FROM user_grant
+         WHERE (?1 IS NULL OR tenant_id = ?1) AND (?2 IS NULL OR sub = ?2)
+         ORDER BY created_at DESC, rowid DESC",
+    )?;
+    let rows = stmt.query_map(params![tenant_id, sub], |r| {
+        let roles: String = r.get(2)?;
+        let indexes: String = r.get(3)?;
+        Ok((|| -> Result<UserGrantRow, RepoError> {
+            Ok(UserGrantRow {
+                sub: r.get(0)?,
+                tenant_id: r.get(1)?,
+                roles: json_list(roles, "user_grant.roles")?,
+                indexes: json_list(indexes, "user_grant.indexes")?,
+                created_at: Timestamp(r.get(4)?),
+                created_by: r.get(5)?,
+                revoked_at: r.get::<_, Option<i64>>(6)?.map(Timestamp),
+            })
+        })())
+    })?;
+    rows.map(|r| r.map_err(RepoError::from).and_then(std::convert::identity))
+        .collect()
+}
+
+/// False if there is no live grant for the pair.
+pub fn revoke_user_grant(
+    conn: &Connection,
+    sub: &str,
+    tenant_id: &str,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "UPDATE user_grant SET revoked_at = ?1
+         WHERE sub = ?2 AND tenant_id = ?3 AND revoked_at IS NULL",
+        params![now.secs(), sub, tenant_id],
+    )?;
+    Ok(changed > 0)
+}
+
 /// One custody's scheduling state, without its secrets.
 ///
 /// The boot-time schedule rebuild needs `next_refresh` and `access_exp` and

@@ -51,6 +51,14 @@ pub mod action {
     pub const SIGNING_KEY_CREATED: &str = "signing_key.created";
     pub const SIGNING_KEY_ROTATED: &str = "signing_key.rotated";
     pub const SIGNING_KEY_REMOVED: &str = "signing_key.removed";
+    pub const TENANT_CREATED: &str = "tenant.created";
+    pub const TENANT_DISABLED: &str = "tenant.disabled";
+    pub const PRINCIPAL_CREATED: &str = "principal.created";
+    pub const PRINCIPAL_REVOKED: &str = "principal.revoked";
+    pub const PRINCIPAL_SECRET_ADDED: &str = "principal.secret_added";
+    pub const PRINCIPAL_SECRET_REVOKED: &str = "principal.secret_revoked";
+    pub const USER_GRANT_CREATED: &str = "user_grant.created";
+    pub const USER_GRANT_REVOKED: &str = "user_grant.revoked";
 
     // Tier B — batched, fail-open.
     pub const SESSION_CREATED: &str = "session.created";

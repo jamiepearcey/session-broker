@@ -431,6 +431,39 @@ date onto keys dated later, with a regression test.
 
 206 crate tests (was 189), clippy clean under `-D warnings`.
 
+## Added since (2026-10-11) — token issuer, slice S2: tenants, principals, grants
+
+Identities as data on the admin lane (`http/admin/identity.rs`), same admin-key
+guard as the rest of `/admin/*`; every mutation is Tier A. No tokens are issued
+yet — nothing resolves a principal secret until S4.
+
+- **Routes**: `GET|POST /admin/tenants`, `DELETE /admin/tenants/{tenant}`
+  (disable); `GET|POST /admin/principals` (`?tenant=`),
+  `GET|DELETE /admin/principals/{id}`; `POST /admin/principals/{id}/secrets`,
+  `DELETE /admin/principals/{id}/secrets/{secret_id}`; `GET|POST
+  /admin/user-grants` (`?tenant=&sub=`), `DELETE /admin/user-grants/{sub}/{tenant}`;
+  `GET /admin/signing-keys` (derived `pending|signing|published|retired|removed`).
+  They work whether or not the issuer is configured; only rotation needs it.
+- **Secrets**: `sbp_` + 32 random bytes (base64url), shown once, SHA-256 of the
+  whole string at rest. **No expiry by default.** Creating a principal returns
+  its first secret; adding one leaves the older ones valid. Optional
+  `expires_in_secs` dates the new secret; optional `expire_old_in_secs` dates the
+  older live ones (never later than they already were; `0` is now). Ids: `sp_`
+  principals, `sps_` secrets.
+- **No tenant step**: naming a tenant slug in a principal or grant creates it in
+  the same transaction. A disabled tenant refuses new principals and grants and
+  its principals stop resolving. A revoked principal keeps its name (the
+  `UNIQUE (tenant_id, name)` from v5).
+- **`repo::find_live_principal_by_secret(conn, hash, now)`** is the lookup S4
+  will use: secret not revoked and not past `expires_at`, principal not revoked,
+  tenant not disabled. Tests drive the clock across each term.
+- **Grants** are keyed `(sub, tenant)`: a revoked grant is revived in place by
+  creating it again; a live one is a 409.
+- Unapplied creates (name taken, grant live, tenant disabled) answer 409 and
+  leave a `failure` audit row with reason `conflict`; unapplied revokes 404.
+- Not audited on their own: a tenant created implicitly by a principal or grant.
+  It rides inside that row's transaction and shows in `GET /admin/tenants`.
+
 ## Known gaps that remain
 
 - **Postgres/HA backend** (ADR-0005): readiness and drain make ONE node well
