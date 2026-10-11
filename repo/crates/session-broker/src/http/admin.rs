@@ -944,7 +944,8 @@ async fn rotate_signing_key(
         return refuse(
             StatusCode::NOT_IMPLEMENTED,
             "lane_disabled",
-            "The signing keys could not be loaded at start, so they cannot be rotated here.",
+            "The token issuer is not configured (token_issuer, issuer_audiences) or its signing keys \
+             could not be loaded at start, so they cannot be rotated here.",
         );
     };
     let request: RotateSigningKeyRequest =

@@ -97,6 +97,14 @@ pub struct Rotation {
     pub immediate: bool,
 }
 
+/// What the public listener holds of the issuer: the signer and the settings
+/// it was configured with.
+#[derive(Clone)]
+pub struct IssuerHandle {
+    pub signer: Arc<Issuer>,
+    pub config: Arc<crate::config::IssuerConfig>,
+}
+
 pub struct Issuer {
     reader: Arc<Reader>,
     writer: WriterHandle,

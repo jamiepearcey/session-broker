@@ -25,6 +25,7 @@ pub mod hardening;
 pub mod internal;
 pub mod ops;
 pub mod session;
+pub mod wellknown;
 
 #[cfg(test)]
 mod tests;
@@ -227,6 +228,9 @@ pub struct AppState {
     /// request shares one peer, and one bucket for the whole user base is worse
     /// than no limiting.
     pub rate_limit: Option<crate::http::guards::RateLimit>,
+    /// The token issuer. `None` until `token_issuer` and `issuer_audiences` are
+    /// configured; its routes then answer `501 lane_disabled`.
+    pub issuer: Option<crate::issuer::IssuerHandle>,
 }
 
 impl FromRef<AppState> for Arc<HttpConfig> {
@@ -256,5 +260,10 @@ pub fn router(state: AppState) -> Router {
         .route("/logout", post(session::post_logout))
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
+        .route("/auth/jwks.json", get(wellknown::jwks))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(wellknown::metadata),
+        )
         .with_state(state)
 }

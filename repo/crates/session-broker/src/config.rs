@@ -93,6 +93,55 @@ pub struct BrokerConfig {
     /// balancer or Kubernetes endpoint controller has time to stop routing here
     /// first. `0` closes immediately — right for a single node behind nothing.
     pub shutdown_drain_delay_secs: u64,
+    /// The token issuer (docs/design/token-issuer-scope.md). `None` leaves the
+    /// feature off: no signing key is created and the issuer routes answer 501.
+    pub issuer: Option<IssuerConfig>,
+}
+
+/// Settings for the token issuer. Present only when `token_issuer` and
+/// `issuer_audiences` are both set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuerConfig {
+    /// The `iss` claim and the metadata `issuer`, without a trailing slash.
+    pub issuer: String,
+    /// Audiences a principal may be issued tokens for.
+    pub audiences: Vec<String>,
+    /// Default lifetime of a machine token.
+    pub machine_ttl_secs: u64,
+    /// Default lifetime of a user token (also capped by the session).
+    pub user_ttl_secs: u64,
+    /// Longest lifetime any token may have. A superseded signing key stays
+    /// published this long after its successor takes over.
+    pub max_ttl_secs: u64,
+    /// How long a new signing key is published before it signs.
+    pub publish_lead_secs: u64,
+    /// `max-age` on the key set and metadata documents.
+    pub jwks_max_age_secs: u64,
+    /// Where the key set is served: `base_url` + `/auth/jwks.json`.
+    pub jwks_uri: String,
+}
+
+impl IssuerConfig {
+    pub fn key_policy(&self) -> crate::issuer::KeyPolicy {
+        crate::issuer::KeyPolicy {
+            publish_lead_secs: self.publish_lead_secs,
+            max_ttl_secs: self.max_ttl_secs,
+        }
+    }
+
+    /// True for an `http://` issuer whose host is not loopback. Allowed (TLS is
+    /// the operator's call) but worth one line in the log at start.
+    pub fn is_plaintext_off_loopback(&self) -> bool {
+        let Some(rest) = self.issuer.strip_prefix("http://") else {
+            return false;
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host = match authority.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => authority.split(':').next().unwrap_or(""),
+        };
+        !matches!(host, "localhost" | "127.0.0.1" | "::1")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,7 +209,7 @@ impl BrokerConfig {
         let internal_bind_addr = parse_field(sources, "internal_bind_addr", "127.0.0.1:8090")?;
 
         let base_url = sources.get_or("base_url", "http://localhost:8080");
-        validate_base_url(&base_url)?;
+        validate_http_url("base_url", &base_url)?;
 
         let db_path = PathBuf::from(sources.get_or("db_path", "session-broker.db"));
         let keyfile_path = PathBuf::from(sources.get_or("keyfile_path", "session-broker.key"));
@@ -328,6 +377,8 @@ impl BrokerConfig {
             });
         }
 
+        let issuer = issuer_config(sources, &base_url)?;
+
         Ok(BrokerConfig {
             bind_addr,
             internal_bind_addr,
@@ -354,6 +405,7 @@ impl BrokerConfig {
             request_timeout_secs,
             shutdown_grace_secs,
             shutdown_drain_delay_secs,
+            issuer,
         })
     }
 }
@@ -482,15 +534,127 @@ fn parse_revocation_policy(sources: &Sources) -> Result<RevocationPolicy, Config
     }
 }
 
+/// The token issuer is off unless both `token_issuer` and `issuer_audiences` are
+/// set; one without the other is a startup failure, as half-configured OIDC is.
+fn issuer_config(sources: &Sources, base_url: &str) -> Result<Option<IssuerConfig>, ConfigError> {
+    let invalid = |field: &'static str, message: String| ConfigError::Invalid { field, message };
+    let (issuer, audiences) = match (sources.get("token_issuer"), sources.get("issuer_audiences")) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(invalid(
+                "issuer_audiences",
+                "required when token_issuer is configured".to_owned(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(invalid(
+                "token_issuer",
+                "required when issuer_audiences is configured".to_owned(),
+            ))
+        }
+        (Some(issuer), Some(audiences)) => (issuer, audiences),
+    };
+
+    validate_http_url("token_issuer", &issuer)?;
+    if issuer.contains(['?', '#']) {
+        return Err(invalid(
+            "token_issuer",
+            format!("must not carry a query or fragment (got {issuer:?})"),
+        ));
+    }
+    let issuer = issuer.trim_end_matches('/').to_owned();
+    let base = base_url.trim_end_matches('/');
+    if issuer != base && !issuer.starts_with(&format!("{base}/")) {
+        return Err(invalid(
+            "token_issuer",
+            format!("must be base_url ({base}) or a URL under it (got {issuer:?})"),
+        ));
+    }
+
+    let mut list: Vec<String> = Vec::new();
+    for audience in audiences.split(',').map(str::trim) {
+        if audience.is_empty()
+            || audience.chars().count() > 128
+            || audience
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(invalid(
+                "issuer_audiences",
+                format!(
+                    "a comma-separated list of 1 to 128 character words without spaces \
+                     (got {audiences:?})"
+                ),
+            ));
+        }
+        if !list.iter().any(|a| a == audience) {
+            list.push(audience.to_owned());
+        }
+    }
+
+    let machine_ttl_secs: u64 = parse_field(sources, "issuer_machine_ttl_secs", "86400")?;
+    let user_ttl_secs: u64 = parse_field(sources, "issuer_user_ttl_secs", "3600")?;
+    let max_ttl_secs: u64 = parse_field(sources, "issuer_max_ttl_secs", "2592000")?;
+    let publish_lead_secs: u64 = parse_field(sources, "signing_key_publish_lead_secs", "86400")?;
+    let jwks_max_age_secs: u64 = parse_field(sources, "issuer_jwks_max_age_secs", "300")?;
+    if !(1..=MAX_TOKEN_TTL_SECS).contains(&max_ttl_secs) {
+        return Err(invalid(
+            "issuer_max_ttl_secs",
+            format!("must be between 1 and {MAX_TOKEN_TTL_SECS} (got {max_ttl_secs})"),
+        ));
+    }
+    for (field, value) in [
+        ("issuer_machine_ttl_secs", machine_ttl_secs),
+        ("issuer_user_ttl_secs", user_ttl_secs),
+    ] {
+        if value == 0 || value > max_ttl_secs {
+            return Err(invalid(
+                field,
+                format!("must be between 1 and issuer_max_ttl_secs ({max_ttl_secs}), got {value}"),
+            ));
+        }
+    }
+    // The rotate route refuses a lead past 30 days, and a lead of zero would
+    // make every ordinary rotation the emergency kind.
+    if !(1..=MAX_PUBLISH_LEAD_SECS).contains(&publish_lead_secs) {
+        return Err(invalid(
+            "signing_key_publish_lead_secs",
+            format!("must be between 1 and {MAX_PUBLISH_LEAD_SECS} (got {publish_lead_secs})"),
+        ));
+    }
+    if jwks_max_age_secs > 86_400 {
+        return Err(invalid(
+            "issuer_jwks_max_age_secs",
+            format!("must be at most 86400 (got {jwks_max_age_secs})"),
+        ));
+    }
+
+    Ok(Some(IssuerConfig {
+        issuer,
+        audiences: list,
+        machine_ttl_secs,
+        user_ttl_secs,
+        max_ttl_secs,
+        publish_lead_secs,
+        jwks_max_age_secs,
+        jwks_uri: format!("{base}/auth/jwks.json"),
+    }))
+}
+
+/// A token may live at most a year (the same bound as a principal's maximum).
+const MAX_TOKEN_TTL_SECS: u64 = 31_536_000;
+/// The rotate route's own bound on `activate_in_secs`.
+const MAX_PUBLISH_LEAD_SECS: u64 = 2_592_000;
+
 /// Minimal manual check: absolute `http://` or `https://`, non-empty host,
 /// no whitespace. Deliberately not a full URL parser (no `url` crate in this
 /// crate's manifest either) — just enough to catch the startup mistakes that
 /// matter (a bare hostname, a typo'd scheme, a copy-pasted value with a
 /// trailing space).
-fn validate_base_url(url: &str) -> Result<(), ConfigError> {
+fn validate_http_url(field: &'static str, url: &str) -> Result<(), ConfigError> {
     if url.chars().any(char::is_whitespace) {
         return Err(ConfigError::Invalid {
-            field: "base_url",
+            field,
             message: format!("must not contain whitespace (got {url:?})"),
         });
     }
@@ -499,7 +663,7 @@ fn validate_base_url(url: &str) -> Result<(), ConfigError> {
         .or_else(|| url.strip_prefix("http://"))
     else {
         return Err(ConfigError::Invalid {
-            field: "base_url",
+            field,
             message: format!("must start with http:// or https:// (got {url:?})"),
         });
     };
@@ -507,7 +671,7 @@ fn validate_base_url(url: &str) -> Result<(), ConfigError> {
     let host_only = host.split(':').next().unwrap_or("");
     if host_only.is_empty() {
         return Err(ConfigError::Invalid {
-            field: "base_url",
+            field,
             message: format!("missing host (got {url:?})"),
         });
     }
@@ -744,6 +908,165 @@ mod tests {
             cfg.oidc.redirect_uri.as_deref(),
             Some("https://edge.example.com/cb")
         );
+    }
+
+    fn issuer_err(pairs: &[(&str, &str)]) -> &'static str {
+        let _guard = lock();
+        match BrokerConfig::from_sources(&sources(pairs)).unwrap_err() {
+            ConfigError::Invalid { field, .. } => field,
+            other => panic!("expected an Invalid error, got {other:?}"),
+        }
+    }
+
+    const ISSUER_ON: [(&str, &str); 3] = [
+        ("base_url", "https://broker.example.com"),
+        ("token_issuer", "https://broker.example.com"),
+        ("issuer_audiences", "logless"),
+    ];
+
+    fn issuer_with(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        let mut pairs: Vec<_> = ISSUER_ON.to_vec();
+        pairs.extend_from_slice(extra);
+        pairs
+    }
+
+    #[test]
+    fn the_issuer_is_off_by_default_and_on_with_its_defaults() {
+        let _guard = lock();
+        assert!(BrokerConfig::from_sources(&sources(&[]))
+            .unwrap()
+            .issuer
+            .is_none());
+
+        let cfg = BrokerConfig::from_sources(&sources(&ISSUER_ON)).unwrap();
+        let issuer = cfg.issuer.unwrap();
+        assert_eq!(issuer.issuer, "https://broker.example.com");
+        assert_eq!(issuer.audiences, vec!["logless".to_owned()]);
+        assert_eq!(issuer.machine_ttl_secs, 86_400);
+        assert_eq!(issuer.user_ttl_secs, 3_600);
+        assert_eq!(issuer.max_ttl_secs, 2_592_000);
+        assert_eq!(issuer.publish_lead_secs, 86_400);
+        assert_eq!(issuer.jwks_max_age_secs, 300);
+        assert_eq!(issuer.jwks_uri, "https://broker.example.com/auth/jwks.json");
+        assert_eq!(issuer.key_policy().publish_lead_secs, 86_400);
+        assert_eq!(issuer.key_policy().max_ttl_secs, 2_592_000);
+    }
+
+    #[test]
+    fn the_issuer_may_sit_under_base_url_and_audiences_are_a_trimmed_list() {
+        let _guard = lock();
+        let cfg = BrokerConfig::from_sources(&sources(&[
+            ("base_url", "https://example.com/broker/"),
+            ("token_issuer", "https://example.com/broker/tenants/"),
+            ("issuer_audiences", " logless , qw,logless "),
+        ]))
+        .unwrap();
+        let issuer = cfg.issuer.unwrap();
+        assert_eq!(issuer.issuer, "https://example.com/broker/tenants");
+        assert_eq!(
+            issuer.audiences,
+            vec!["logless".to_owned(), "qw".to_owned()]
+        );
+        assert_eq!(issuer.jwks_uri, "https://example.com/broker/auth/jwks.json");
+    }
+
+    #[test]
+    fn issuer_settings_need_each_other() {
+        assert_eq!(
+            issuer_err(&[("token_issuer", "http://localhost:8080")]),
+            "issuer_audiences"
+        );
+        assert_eq!(
+            issuer_err(&[("issuer_audiences", "logless")]),
+            "token_issuer"
+        );
+    }
+
+    #[test]
+    fn a_token_issuer_outside_base_url_is_refused() {
+        for bad in [
+            "https://other.example.com",
+            "https://broker.example.com.evil.net",
+            "http://broker.example.com",
+            "https://broker.example.com?x=1",
+            "https://broker.example.com#frag",
+            "broker.example.com",
+        ] {
+            assert_eq!(
+                issuer_err(&[
+                    ("base_url", "https://broker.example.com"),
+                    ("token_issuer", bad),
+                    ("issuer_audiences", "logless"),
+                ]),
+                "token_issuer",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_audiences_are_refused() {
+        for bad in ["", ",", "a,,b", "has space", &"x".repeat(129)] {
+            assert_eq!(
+                issuer_err(&[
+                    ("token_issuer", "http://localhost:8080"),
+                    ("issuer_audiences", bad),
+                ]),
+                "issuer_audiences",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issuer_numbers_are_bounded() {
+        for (field, value) in [
+            ("issuer_machine_ttl_secs", "0"),
+            ("issuer_machine_ttl_secs", "99999999"),
+            ("issuer_user_ttl_secs", "0"),
+            ("issuer_user_ttl_secs", "3000000"),
+            ("issuer_max_ttl_secs", "0"),
+            ("issuer_max_ttl_secs", "31536001"),
+            ("signing_key_publish_lead_secs", "0"),
+            ("signing_key_publish_lead_secs", "2592001"),
+            ("issuer_jwks_max_age_secs", "86401"),
+            ("issuer_jwks_max_age_secs", "soon"),
+        ] {
+            assert_eq!(
+                issuer_err(&issuer_with(&[(field, value)])),
+                field,
+                "{field}={value}"
+            );
+        }
+        // Raising the ceiling makes a longer default legal.
+        let _guard = lock();
+        let cfg = BrokerConfig::from_sources(&sources(&issuer_with(&[
+            ("issuer_max_ttl_secs", "7776000"),
+            ("issuer_machine_ttl_secs", "7776000"),
+        ])))
+        .unwrap();
+        assert_eq!(cfg.issuer.unwrap().machine_ttl_secs, 7_776_000);
+    }
+
+    #[test]
+    fn plaintext_is_flagged_only_off_loopback_and_never_refused() {
+        let _guard = lock();
+        let flagged = |base: &str| {
+            BrokerConfig::from_sources(&sources(&[
+                ("base_url", base),
+                ("token_issuer", base),
+                ("issuer_audiences", "logless"),
+            ]))
+            .unwrap()
+            .issuer
+            .unwrap()
+            .is_plaintext_off_loopback()
+        };
+        assert!(flagged("http://broker.internal:8080"));
+        assert!(!flagged("https://broker.example.com"));
+        assert!(!flagged("http://localhost:8080"));
+        assert!(!flagged("http://127.0.0.1:8080"));
+        assert!(!flagged("http://[::1]:8080"));
     }
 
     #[test]

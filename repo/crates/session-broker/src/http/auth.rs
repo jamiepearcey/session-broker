@@ -358,6 +358,7 @@ mod tests {
                 audit: None,
                 metrics: crate::telemetry::Metrics::new(),
                 rate_limit: None,
+                issuer: None,
             };
             let router = crate::http::router(state).layer(Extension(Arc::new(oidc)));
 

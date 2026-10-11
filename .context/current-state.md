@@ -411,8 +411,9 @@ this slice is the keys and the signer.
   `kid` = base64url(SHA-256(public key)[..8]).
 - **No state column.** Pending / signing / published are derived from
   `activate_at` / `retire_at` / `removed_at` against the clock.
-- **First boot creates one key** with a Tier A `signing_key.created` row, whether
-  or not the issuer is configured (config arrives in S3).
+- **First boot creates one key** with a Tier A `signing_key.created` row. From S3
+  this happens only when the issuer is configured (`token_issuer` and
+  `issuer_audiences`); an unconfigured broker creates no key.
 - **Rotation is an operation**: `POST /admin/signing-keys/rotate`
   (`{"activate_in_secs": N}`, default a day) and
   `session-broker rotate-signing-key [--now]`. Zero lead = emergency: the new key
@@ -463,6 +464,34 @@ yet — nothing resolves a principal secret until S4.
   leave a `failure` audit row with reason `conflict`; unapplied revokes 404.
 - Not audited on their own: a tenant created implicitly by a principal or grant.
   It rides inside that row's transaction and shows in `GET /admin/tenants`.
+
+## Added since (2026-10-11) — token issuer, slice S3: publication and config
+
+The issuer is on only when `token_issuer` and `issuer_audiences` are both set
+(one without the other is a startup error). Off, no signing key is created and
+both documents answer `501 lane_disabled`.
+
+- **Routes (public listener)**: `GET /auth/jwks.json` (every published key,
+  pending ones included) and `GET /.well-known/oauth-authorization-server`
+  (`issuer`, `jwks_uri`, `response_types_supported`; the token endpoint is added
+  by S4). Both send `Cache-Control: public, max-age=<issuer_jwks_max_age_secs>,
+  stale-if-error=2592000`, an `ETag` (304 on `If-None-Match`) and a `Date`. The
+  hardening layer only adds `no-store` when a handler set no `Cache-Control`, so
+  these are untouched; a test runs them through that layer.
+- **Config** (`BROKER_*` or the file): `token_issuer` (equal to `base_url` or a
+  URL under it, no query or fragment, trailing slash dropped), `issuer_audiences`
+  (comma list), `issuer_machine_ttl_secs=86400`, `issuer_user_ttl_secs=3600`,
+  `issuer_max_ttl_secs=2592000`, `signing_key_publish_lead_secs=86400`,
+  `issuer_jwks_max_age_secs=300`. The TTLs must be 1..=`issuer_max_ttl_secs`
+  (itself 1..=365 days); the lead 1..=30 days. `jwks_uri` is `base_url` +
+  `/auth/jwks.json`. `BrokerConfig.issuer: Option<IssuerConfig>`;
+  `IssuerConfig::key_policy()` feeds `bootstrap`, the rotate route and the CLI.
+- **No `issuer_allow_plaintext`, no introspection setting.** An `http://` issuer
+  off loopback logs one warning at start and is allowed. (`base_url` itself is
+  still refused off loopback over http by `HttpConfig::new`, so today that warning
+  can only fire if that rule is relaxed.)
+- **Wiring**: `AppState.issuer: Option<IssuerHandle { signer, config }>`;
+  `AdminState.issuer` keeps the bare `Arc<Issuer>`.
 
 ## Known gaps that remain
 

@@ -124,21 +124,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now = clock.now();
 
     // The token issuer's signing keys: loaded, and the first one created if the
-    // store has none. A failure here costs token issuance only — sessions and
-    // custody do not depend on it, so the broker still starts.
-    let issuer = match session_broker::issuer::bootstrap(
-        reader.clone(),
-        writer_handle.clone(),
-        Some(audit.clone()),
-        clock.clone(),
-        session_broker::issuer::KeyPolicy::default(),
-    ) {
-        Ok(issuer) => Some(issuer),
-        Err(e) => {
-            tracing::error!(error = %e, "signing keys could not be loaded; token issuance is off");
-            None
+    // store has none. Off unless `token_issuer` and `issuer_audiences` are set,
+    // and a failure here costs token issuance only: sessions and custody do not
+    // depend on it, so the broker still starts.
+    let issuer = config.issuer.as_ref().and_then(|cfg| {
+        if cfg.is_plaintext_off_loopback() {
+            tracing::warn!(
+                issuer = %cfg.issuer,
+                "token_issuer is http:// off loopback: verifiers fetch the signing keys \
+                 over plaintext, so anyone on the path can substitute their own"
+            );
         }
-    };
+        match session_broker::issuer::bootstrap(
+            reader.clone(),
+            writer_handle.clone(),
+            Some(audit.clone()),
+            clock.clone(),
+            cfg.key_policy(),
+        ) {
+            Ok(signer) => Some(session_broker::issuer::IssuerHandle {
+                signer,
+                config: Arc::new(cfg.clone()),
+            }),
+            Err(e) => {
+                tracing::error!(error = %e, "signing keys could not be loaded; token issuance is off");
+                None
+            }
+        }
+    });
 
     let sessions = Arc::new(SessionMap::with_durability(policy, writer_handle.clone()));
     let restored = rehydrate_sessions(&reader, &sessions);
@@ -245,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit: Some(audit.clone()),
         metrics: metrics.clone(),
         rate_limit: public_rate_limit,
+        issuer: issuer.clone(),
     };
 
     let internal_state = InternalState {
@@ -288,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log: Some(log.clone()),
         metrics: metrics.clone(),
         rate_limit: admin_rate_limit,
-        issuer: issuer.clone(),
+        issuer: issuer.as_ref().map(|h| h.signer.clone()),
     };
     if admin_state.admin_key.is_none() {
         tracing::warn!(
@@ -343,7 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // level comes back down on its own.
     tokio::spawn(run_audit_pruner(
         audit.clone(),
-        issuer.clone(),
+        issuer.as_ref().map(|h| h.signer.clone()),
         clock.clone(),
     ));
     tokio::spawn(run_reaper(
@@ -534,7 +548,11 @@ fn rotate_signing_key(
         writer.handle(),
         Some(audit),
         Arc::new(SystemClock),
-        session_broker::issuer::KeyPolicy::default(),
+        config
+            .issuer
+            .as_ref()
+            .map(|cfg| cfg.key_policy())
+            .unwrap_or_default(),
     )?;
     Ok(issuer.rotate(immediate.then_some(0), "cli")?)
 }
