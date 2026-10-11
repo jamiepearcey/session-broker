@@ -11,9 +11,22 @@
 // in memory only, and forgotten when the tab closes.
 
 import { useState } from "react";
-import { Activity, HeartPulse, KeyRound, ScrollText, ShieldCheck, Users } from "lucide-react";
+import {
+  Activity,
+  Fingerprint,
+  HeartPulse,
+  KeyRound,
+  ScrollText,
+  ShieldCheck,
+  UserCheck,
+  Users,
+  Workflow,
+} from "lucide-react";
 
 import { Keys } from "@/views/Keys";
+import { Principals } from "@/views/Principals";
+import { UserGrants } from "@/views/UserGrants";
+import { SigningKeys } from "@/views/SigningKeys";
 import { Sessions } from "@/views/Sessions";
 import { CustodyView } from "@/views/CustodyView";
 import { AuditView } from "@/views/AuditView";
@@ -21,10 +34,13 @@ import { ObservabilityView } from "@/views/ObservabilityView";
 import { hasAdminKey, setAdminKey } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ViewId = "keys" | "sessions" | "custody" | "audit" | "observability";
+type ViewId = "keys" | "principals" | "grants" | "signing" | "sessions" | "custody" | "audit" | "observability";
 
 const VIEWS = [
   { id: "keys" as const, label: "API keys", icon: KeyRound },
+  { id: "principals" as const, label: "Principals", icon: Workflow },
+  { id: "grants" as const, label: "User grants", icon: UserCheck },
+  { id: "signing" as const, label: "Signing keys", icon: Fingerprint },
   { id: "sessions" as const, label: "Sessions", icon: Users },
   { id: "custody" as const, label: "Custody", icon: HeartPulse },
   // The record, then the plumbing. An operator reaches for the trail during an
@@ -86,6 +102,9 @@ export default function App() {
 
       <main className="min-w-0 flex-1">
         {view === "keys" && <Keys />}
+        {view === "principals" && <Principals />}
+        {view === "grants" && <UserGrants />}
+        {view === "signing" && <SigningKeys />}
         {view === "sessions" && <Sessions />}
         {view === "custody" && <CustodyView />}
         {view === "audit" && <AuditView />}

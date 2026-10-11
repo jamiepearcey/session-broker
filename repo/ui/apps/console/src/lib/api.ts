@@ -126,7 +126,45 @@ export interface SigningKey {
   activate_at: number;
   retire_at: number | null;
   removed_at: number | null;
+  /** As the broker saw it when it answered; the console re-derives it from the timestamps. */
   state: "pending" | "signing" | "published" | "retired" | "removed";
+}
+
+export type SigningKeyState = SigningKey["state"];
+
+/** `POST /admin/signing-keys/rotate`: what the new key will do and when. */
+export interface Rotation {
+  kid: string;
+  activate_at: number;
+  previous_retire_at: number;
+  /** True when the older keys stopped being published at once. */
+  immediate: boolean;
+  note: string;
+}
+
+/**
+ * A key's state at `now` (unix seconds), from its timestamps alone.
+ *
+ * Same rule as the broker: published keys are the ones neither removed nor past
+ * `retire_at` (pending ones included), and the newest published key that has
+ * started is the one signing. `keys` must be newest first, as the broker lists
+ * them. Deriving it here keeps the column right between refreshes — a pending key
+ * becomes the signing key at `activate_at` without anyone reloading.
+ */
+export function signingKeyStates(keys: SigningKey[], now: number): Map<string, SigningKeyState> {
+  const states = new Map<string, SigningKeyState>();
+  let signingTaken = false;
+  for (const k of keys) {
+    const published = k.removed_at === null && (k.retire_at === null || k.retire_at > now);
+    if (k.removed_at !== null) states.set(k.kid, "removed");
+    else if (!published) states.set(k.kid, "retired");
+    else if (k.activate_at > now) states.set(k.kid, "pending");
+    else if (!signingTaken) {
+      signingTaken = true;
+      states.set(k.kid, "signing");
+    } else states.set(k.kid, "published");
+  }
+  return states;
 }
 
 /** One row of the durable audit record (ADR-0015). */
@@ -304,7 +342,8 @@ export const adminApi = {
       `/principals/${encodeURIComponent(principalId)}/secrets/${encodeURIComponent(secretId)}`,
       { method: "DELETE" },
     ),
-  userGrants: () => call<UserGrant[]>("/user-grants"),
+  userGrants: (tenant?: string) =>
+    call<UserGrant[]>(`/user-grants${tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""}`),
   createUserGrant: (grant: { sub: string; tenant?: string; roles: string[]; indexes?: string[] }) =>
     call<UserGrant>("/user-grants", { method: "POST", body: JSON.stringify(grant) }),
   revokeUserGrant: (sub: string, tenant: string) =>
@@ -312,6 +351,14 @@ export const adminApi = {
       method: "DELETE",
     }),
   signingKeys: () => call<SigningKey[]>("/signing-keys"),
+  /** Omit `activateInSecs` for the broker's default lead; `0` retires the older keys now. */
+  rotateSigningKey: (activateInSecs?: number) =>
+    call<Rotation>("/signing-keys/rotate", {
+      method: "POST",
+      ...(activateInSecs === undefined
+        ? {}
+        : { body: JSON.stringify({ activate_in_secs: activateInSecs }) }),
+    }),
   audit: (filters: AuditFilters = {}) => call<AuditPage>(`/audit${auditQuery(filters)}`),
   observability: () => call<Observability>("/observability"),
   setLogLevel: (filter: string, durationSecs: number) =>
