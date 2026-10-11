@@ -62,6 +62,8 @@ fn issuer_config() -> IssuerConfig {
         jwks_max_age_secs: 300,
         jwks_uri: format!("{ISSUER}/auth/jwks.json"),
         token_endpoint: format!("{ISSUER}/auth/token"),
+        default_user_tenant: Some("default".to_owned()),
+        default_user_roles: vec!["viewer".to_owned()],
     }
 }
 

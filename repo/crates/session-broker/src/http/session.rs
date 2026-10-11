@@ -259,7 +259,7 @@ fn presented(headers: &HeaderMap, config: &HttpConfig) -> Option<TokenHash> {
     guards::cookie(headers, config.session_cookie_name()).map(TokenHash::of)
 }
 
-fn unauthenticated(config: &HttpConfig, return_to: Option<&str>) -> ApiError {
+pub(super) fn unauthenticated(config: &HttpConfig, return_to: Option<&str>) -> ApiError {
     ApiError::new(ErrorCode::InvalidSession, "no session cookie presented")
         .with_login_url(config.login_url(return_to))
 }
@@ -276,7 +276,11 @@ fn map_denial(denied: RefreshDenied, config: &HttpConfig, return_to: Option<&str
     }
 }
 
-fn denial(resolution: Resolution, config: &HttpConfig, return_to: Option<&str>) -> ApiError {
+pub(super) fn denial(
+    resolution: Resolution,
+    config: &HttpConfig,
+    return_to: Option<&str>,
+) -> ApiError {
     match resolution {
         Resolution::HardExpired { reason, .. } => expired_error(reason, config),
         Resolution::Retired { gen_no, .. } => ApiError::new(

@@ -116,6 +116,13 @@ pub struct IssuerHandle {
     pub client_failures: Option<Arc<crate::ratelimit::Limiter>>,
 }
 
+/// See [`Issuer::user_grants`].
+#[derive(Debug)]
+pub struct UserGrants {
+    pub live: Vec<repo::UserGrantRow>,
+    pub any_row: bool,
+}
+
 pub struct Issuer {
     reader: Arc<Reader>,
     writer: WriterHandle,
@@ -259,6 +266,21 @@ impl Issuer {
         let now = self.clock.now();
         self.reader
             .with(|conn| repo::find_live_principal_by_secret(conn, &hash, now))
+            .map_err(|e| IssuerError::Store(e.to_string()))
+    }
+
+    /// What the grant table says about a signed-in user: the grants a token
+    /// can be issued on now, and whether the table has ever held a row for
+    /// them (a revoked grant is still an answer, and must not fall through to
+    /// the install's default tenant).
+    pub fn user_grants(&self, sub: &str) -> Result<UserGrants, IssuerError> {
+        self.reader
+            .with(|conn| -> Result<UserGrants, repo::RepoError> {
+                let live = repo::find_live_user_grants(conn, sub)?;
+                let any_row =
+                    !live.is_empty() || !repo::list_user_grants(conn, None, Some(sub))?.is_empty();
+                Ok(UserGrants { live, any_row })
+            })
             .map_err(|e| IssuerError::Store(e.to_string()))
     }
 

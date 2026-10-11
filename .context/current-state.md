@@ -541,6 +541,40 @@ issuer is configured.
 - An issued token cannot be revoked. Revoking the principal or the secret stops
   the next one.
 
+### S5: user tokens (`POST /session/token`)
+
+A signed-in user trades their session for a signed token. Public listener,
+`501 lane_disabled` until the issuer is configured.
+
+- **Request**: cookie-authenticated, JSON `{"audience", "tenant"?}`. INV-2 runs
+  first (`403 csrf_rejected`). The session must be `Active`, exactly as `/authz`
+  requires: no cookie or an unknown one is `401 invalid_session`, a stale
+  generation `401 session_stale` (refresh, retry), an expired or logged-out
+  session `401 session_expired`.
+- **Response**: `{access_token, token_type: "Bearer", expires_in, tenant, roles,
+  indexes}`, `no-store`. Lifetime is `issuer_user_ttl_secs`, cut short at the
+  session's idle expiry.
+- **Claims**: `iss`, `sub` (the identity provider subject), `sid` (the broker
+  session id, never the cookie), `aud`, `exp`, `iat`, `jti`, `kind: "user"`,
+  `tenant`, `roles`, `indexes`. Header `alg=EdDSA`, `typ=JWT`, `kid`.
+- **Tenant, roles and indexes come only from `user_grant`** for the subject
+  (`repo::find_live_user_grants`: not revoked, tenant not disabled). One grant:
+  `tenant` may be omitted. Several and no `tenant`: `400 bad_request`. A tenant
+  with no grant: `403 not_granted`. `audience` must be in `issuer_audiences`:
+  `400 bad_audience`.
+- **Single-tenant default** (scope addendum): a subject the table has never held
+  a row for gets `default_user_tenant` (default `default`) with
+  `default_user_roles` (default `viewer`) and `indexes: ["*"]`. `none` (or empty
+  in the file) turns it off. A subject whose grants were all revoked, or sit in
+  a disabled tenant, is NOT rescued by the default: `403 not_granted`.
+- **`/internal/token` is unchanged** (the scope addendum dropped the opt-in
+  `token_type: "broker"`), as is `/authz`.
+- **Audit** (Tier B, actor `user`): `token.issued` carries `subject` and `sid`,
+  detail `{aud, kind, tenant, kid, jti, ttl}`, coalesced per (subject, audience)
+  per `audit_coalesce_secs`; `token.issuance_refused` once a user is known
+  (reason = the error code), never coalesced. A forged or cookie-less request is
+  counted in the metric only. `broker_tokens_issued_total{kind="user",outcome}`.
+
 ## Known gaps that remain
 
 - **Postgres/HA backend** (ADR-0005): readiness and drain make ONE node well

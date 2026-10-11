@@ -27,6 +27,14 @@ pub enum ErrorCode {
     OauthError,
     BadRequest,
     RateLimited,
+    /// The signed-in user holds no grant for what they asked for.
+    NotGranted,
+    /// An audience this issuer is not configured to sign for.
+    BadAudience,
+    /// The feature is off.
+    LaneDisabled,
+    /// The broker could not read its own store or sign.
+    Unavailable,
 }
 
 impl ErrorCode {
@@ -36,9 +44,13 @@ impl ErrorCode {
             | ErrorCode::SessionStale
             | ErrorCode::SessionExpired
             | ErrorCode::LoginRequired => StatusCode::UNAUTHORIZED,
-            ErrorCode::CsrfRejected => StatusCode::FORBIDDEN,
+            ErrorCode::CsrfRejected | ErrorCode::NotGranted => StatusCode::FORBIDDEN,
             ErrorCode::UpstreamRevoked => StatusCode::CONFLICT,
-            ErrorCode::OauthError | ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
+            ErrorCode::OauthError | ErrorCode::BadRequest | ErrorCode::BadAudience => {
+                StatusCode::BAD_REQUEST
+            }
+            ErrorCode::LaneDisabled => StatusCode::NOT_IMPLEMENTED,
+            ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         }
     }

@@ -26,6 +26,7 @@ pub mod internal;
 pub mod ops;
 pub mod session;
 pub mod token;
+pub mod user_token;
 pub mod wellknown;
 
 #[cfg(test)]
@@ -262,6 +263,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/token", post(token::issue))
+        .route("/session/token", post(user_token::issue))
         .route("/auth/jwks.json", get(wellknown::jwks))
         .route(
             "/.well-known/oauth-authorization-server",

@@ -121,6 +121,12 @@ pub struct IssuerConfig {
     pub jwks_uri: String,
     /// Where machine tokens are issued: `base_url` + `/auth/token`.
     pub token_endpoint: String,
+    /// The tenant a signed-in user gets a token for when the broker holds no
+    /// grant row for them at all, so a single-tenant install needs no admin
+    /// step. `None` requires an explicit grant for everyone.
+    pub default_user_tenant: Option<String>,
+    /// The roles that default carries.
+    pub default_user_roles: Vec<String>,
 }
 
 impl IssuerConfig {
@@ -631,6 +637,38 @@ fn issuer_config(sources: &Sources, base_url: &str) -> Result<Option<IssuerConfi
         ));
     }
 
+    // Empty in the file, or `none` anywhere (an empty environment variable
+    // counts as unset), turns the default off.
+    let default_user_tenant = match sources.get_or("default_user_tenant", "default").trim() {
+        "" | "none" => None,
+        slug if is_slug(slug) => Some(slug.to_owned()),
+        other => {
+            return Err(invalid(
+                "default_user_tenant",
+                format!("must be a tenant slug such as \"default\", or \"none\" (got {other:?})"),
+            ))
+        }
+    };
+    let roles = sources.get_or("default_user_roles", "viewer");
+    let mut default_user_roles: Vec<String> = Vec::new();
+    for role in roles.split(',').map(str::trim) {
+        if role.is_empty()
+            || role.chars().count() > 128
+            || role.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(invalid(
+                "default_user_roles",
+                format!(
+                    "a comma-separated list of 1 to 128 character words without spaces \
+                     (got {roles:?})"
+                ),
+            ));
+        }
+        if !default_user_roles.iter().any(|r| r == role) {
+            default_user_roles.push(role.to_owned());
+        }
+    }
+
     Ok(Some(IssuerConfig {
         issuer,
         audiences: list,
@@ -641,7 +679,18 @@ fn issuer_config(sources: &Sources, base_url: &str) -> Result<Option<IssuerConfi
         jwks_max_age_secs,
         jwks_uri: format!("{base}/auth/jwks.json"),
         token_endpoint: format!("{base}/auth/token"),
+        default_user_tenant,
+        default_user_roles,
     }))
+}
+
+/// `^[a-z0-9][a-z0-9-]{0,62}$`, the tenant slug rule.
+fn is_slug(s: &str) -> bool {
+    let b = s.as_bytes();
+    (1..=63).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 /// A token may live at most a year (the same bound as a principal's maximum).
@@ -953,6 +1002,49 @@ mod tests {
         assert_eq!(issuer.jwks_uri, "https://broker.example.com/auth/jwks.json");
         assert_eq!(issuer.key_policy().publish_lead_secs, 86_400);
         assert_eq!(issuer.key_policy().max_ttl_secs, 2_592_000);
+        assert_eq!(issuer.default_user_tenant.as_deref(), Some("default"));
+        assert_eq!(issuer.default_user_roles, vec!["viewer".to_owned()]);
+    }
+
+    #[test]
+    fn the_default_user_tenant_can_be_changed_or_switched_off() {
+        let _guard = lock();
+        let issuer = |extra: &[(&'static str, &'static str)]| {
+            BrokerConfig::from_sources(&sources(&issuer_with(extra)))
+                .unwrap()
+                .issuer
+                .unwrap()
+        };
+        let custom = issuer(&[
+            ("default_user_tenant", "acme"),
+            ("default_user_roles", " reader , writer,reader "),
+        ]);
+        assert_eq!(custom.default_user_tenant.as_deref(), Some("acme"));
+        assert_eq!(
+            custom.default_user_roles,
+            vec!["reader".to_owned(), "writer".to_owned()]
+        );
+        assert_eq!(
+            issuer(&[("default_user_tenant", "none")]).default_user_tenant,
+            None
+        );
+        assert_eq!(
+            issuer(&[("default_user_tenant", " ")]).default_user_tenant,
+            None
+        );
+    }
+
+    #[test]
+    fn a_bad_default_user_tenant_or_role_fails_at_boot() {
+        for (field, bad) in [
+            ("default_user_tenant", "Acme"),
+            ("default_user_tenant", "has space"),
+            ("default_user_tenant", "-lead"),
+            ("default_user_roles", "viewer,,admin"),
+            ("default_user_roles", "two words"),
+        ] {
+            assert_eq!(issuer_err(&issuer_with(&[(field, bad)])), field, "{bad}");
+        }
     }
 
     #[test]

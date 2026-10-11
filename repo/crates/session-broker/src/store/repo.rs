@@ -1050,6 +1050,22 @@ pub fn insert_user_grant(
     Ok(changed > 0)
 }
 
+fn user_grant_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<UserGrantRow, RepoError>> {
+    let roles: String = r.get(2)?;
+    let indexes: String = r.get(3)?;
+    Ok((|| -> Result<UserGrantRow, RepoError> {
+        Ok(UserGrantRow {
+            sub: r.get(0)?,
+            tenant_id: r.get(1)?,
+            roles: json_list(roles, "user_grant.roles")?,
+            indexes: json_list(indexes, "user_grant.indexes")?,
+            created_at: Timestamp(r.get(4)?),
+            created_by: r.get(5)?,
+            revoked_at: r.get::<_, Option<i64>>(6)?.map(Timestamp),
+        })
+    })())
+}
+
 /// Every grant, newest first, optionally of one tenant and/or one subject.
 pub fn list_user_grants(
     conn: &Connection,
@@ -1062,21 +1078,21 @@ pub fn list_user_grants(
          WHERE (?1 IS NULL OR tenant_id = ?1) AND (?2 IS NULL OR sub = ?2)
          ORDER BY created_at DESC, rowid DESC",
     )?;
-    let rows = stmt.query_map(params![tenant_id, sub], |r| {
-        let roles: String = r.get(2)?;
-        let indexes: String = r.get(3)?;
-        Ok((|| -> Result<UserGrantRow, RepoError> {
-            Ok(UserGrantRow {
-                sub: r.get(0)?,
-                tenant_id: r.get(1)?,
-                roles: json_list(roles, "user_grant.roles")?,
-                indexes: json_list(indexes, "user_grant.indexes")?,
-                created_at: Timestamp(r.get(4)?),
-                created_by: r.get(5)?,
-                revoked_at: r.get::<_, Option<i64>>(6)?.map(Timestamp),
-            })
-        })())
-    })?;
+    let rows = stmt.query_map(params![tenant_id, sub], user_grant_row)?;
+    rows.map(|r| r.map_err(RepoError::from).and_then(std::convert::identity))
+        .collect()
+}
+
+/// The grants `sub` can be issued a token on right now: not revoked, and the
+/// tenant not disabled. Newest first.
+pub fn find_live_user_grants(conn: &Connection, sub: &str) -> Result<Vec<UserGrantRow>, RepoError> {
+    let mut stmt = conn.prepare(
+        "SELECT g.sub, g.tenant_id, g.roles, g.indexes, g.created_at, g.created_by, g.revoked_at
+         FROM user_grant g JOIN tenant t ON t.tenant_id = g.tenant_id
+         WHERE g.sub = ?1 AND g.revoked_at IS NULL AND t.disabled_at IS NULL
+         ORDER BY g.created_at DESC, g.rowid DESC",
+    )?;
+    let rows = stmt.query_map(params![sub], user_grant_row)?;
     rows.map(|r| r.map_err(RepoError::from).and_then(std::convert::identity))
         .collect()
 }
