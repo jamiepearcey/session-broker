@@ -112,7 +112,10 @@ function statusFromMeta(meta: SessionMeta | null, nowMs: number): SessionStatus 
 
 export function SessionProvider(props: SessionProviderProps): ReactElement {
   const { children } = props;
-  const fetchImplRef = useRef(props.fetchImpl ?? fetch);
+  // The ref is invoked as `fetchImplRef.current(...)`, a method call: a browser's bare `fetch` (the default,
+  // or a `fetchImpl` a host passes as `window.fetch`) throws "Illegal invocation" when its `this` is not the
+  // window. Wrap it in an arrow so `this` never matters.
+  const fetchImplRef = useRef<typeof fetch>((input, init) => (props.fetchImpl ?? fetch)(input, init));
   const eventsModeRef = useRef<SessionEventsMode>(props.events ?? 'leader-only');
   const eventSourceFactoryRef = useRef(props.eventSourceFactory);
 
