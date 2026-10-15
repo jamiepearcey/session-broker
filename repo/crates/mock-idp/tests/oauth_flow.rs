@@ -395,3 +395,165 @@ async fn userinfo_requires_a_valid_bearer_token() {
 
     handle.shutdown().await;
 }
+
+fn two_user_config() -> MockIdpConfig {
+    use mock_idp::config::UserConfig;
+    MockIdpConfig {
+        users: vec![
+            UserConfig {
+                subject: "alice".to_owned(),
+                email: "alice@example.test".to_owned(),
+                name: "Alice <Analyst>".to_owned(),
+            },
+            UserConfig {
+                subject: "bob".to_owned(),
+                email: "bob@example.test".to_owned(),
+                name: "Bob".to_owned(),
+            },
+        ],
+        ..MockIdpConfig::default()
+    }
+}
+
+async fn authorize_with(
+    client: &reqwest::Client,
+    base: &str,
+    challenge: &str,
+    extra: &[(&str, &str)],
+) -> reqwest::Response {
+    let mut query = vec![
+        ("response_type", "code"),
+        ("client_id", CLIENT_ID),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("state", "xyz"),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+    ];
+    query.extend_from_slice(extra);
+    client
+        .get(format!("{base}/authorize"))
+        .query(&query)
+        .send()
+        .await
+        .expect("authorize request succeeds")
+}
+
+/// Sign in as `login_as`, exchange the code, and return the id_token `sub`.
+async fn id_token_sub_for(client: &reqwest::Client, base: &str, login_as: &str) -> String {
+    let (verifier, challenge) = pkce_pair();
+    let response = authorize_with(client, base, &challenge, &[("login_as", login_as)]).await;
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    let location = response.headers()[reqwest::header::LOCATION]
+        .to_str()
+        .expect("utf-8");
+    let params: HashMap<String, String> = Url::parse(location)
+        .expect("url")
+        .query_pairs()
+        .into_owned()
+        .collect();
+    let code = params.get("code").expect("a code, not an error");
+    let body: serde_json::Value = exchange_code(client, base, code, &verifier)
+        .await
+        .json()
+        .await
+        .expect("json");
+    let id_token = body["id_token"].as_str().expect("id_token");
+    let payload = id_token.split('.').nth(1).expect("jws payload");
+    let claims: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("b64")).expect("json");
+    claims["sub"].as_str().expect("sub").to_owned()
+}
+
+#[tokio::test]
+async fn several_users_without_login_as_get_an_escaped_chooser() {
+    let handle = spawn_mock_idp(two_user_config()).await.expect("spawns");
+    let client = no_redirect_client();
+    let (_verifier, challenge) = pkce_pair();
+
+    let response = authorize_with(&client, handle.base_url(), &challenge, &[]).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let page = response.text().await.expect("body");
+    assert!(page.contains("login_as=alice"), "{page}");
+    assert!(page.contains("login_as=bob"), "{page}");
+    assert!(page.contains("state=xyz"), "request params survive: {page}");
+    assert!(page.contains("Alice &lt;Analyst&gt;"), "escaped: {page}");
+    assert!(
+        !page.contains("<Analyst>"),
+        "raw name must not appear: {page}"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn login_as_selects_which_user_the_id_token_names() {
+    let handle = spawn_mock_idp(two_user_config()).await.expect("spawns");
+    let client = no_redirect_client();
+
+    assert_eq!(
+        id_token_sub_for(&client, handle.base_url(), "bob").await,
+        "bob"
+    );
+    assert_eq!(
+        id_token_sub_for(&client, handle.base_url(), "alice").await,
+        "alice"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_login_as_redirects_with_invalid_request() {
+    let handle = spawn_mock_idp(two_user_config()).await.expect("spawns");
+    let client = no_redirect_client();
+    let (_verifier, challenge) = pkce_pair();
+
+    let response = authorize_with(
+        &client,
+        handle.base_url(),
+        &challenge,
+        &[("login_as", "mallory")],
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    let location = response.headers()[reqwest::header::LOCATION]
+        .to_str()
+        .expect("utf-8");
+    assert!(location.contains("error=invalid_request"), "{location}");
+    assert!(!location.contains("code="), "{location}");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_none_with_several_users_and_no_login_as_is_login_required() {
+    let handle = spawn_mock_idp(two_user_config()).await.expect("spawns");
+    let client = no_redirect_client();
+    let (_verifier, challenge) = pkce_pair();
+
+    let response = authorize_with(
+        &client,
+        handle.base_url(),
+        &challenge,
+        &[("prompt", "none")],
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    let location = response.headers()[reqwest::header::LOCATION]
+        .to_str()
+        .expect("utf-8");
+    assert!(location.contains("error=login_required"), "{location}");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_user_subjects_are_refused_at_startup() {
+    let mut config = two_user_config();
+    config.users[1].subject = "alice".to_owned();
+    assert!(spawn_mock_idp(config).await.is_err());
+}

@@ -1,6 +1,8 @@
 //! `GET /authorize` — authorization-code + PKCE, with no interactive login
-//! UI: `login_as` picks which canned user "is" the logged-in subject,
-//! defaulting to the first configured user.
+//! login: `login_as` picks which canned user "is" the logged-in subject.
+//! With one configured user it is optional (that user is used). With several
+//! and no `login_as`, a plain chooser page links back here with `login_as`
+//! set (`prompt=none` cannot show a page, so it gets `login_required`).
 
 use axum::{
     extract::{Query, State},
@@ -24,8 +26,8 @@ pub struct AuthorizeParams {
     pub code_challenge_method: Option<String>,
     pub nonce: Option<String>,
     pub prompt: Option<String>,
-    /// Subject of the canned user to "log in" as. Defaults to the first
-    /// configured user when omitted.
+    /// Subject of the canned user to "log in" as. Optional only while a
+    /// single user is configured.
     pub login_as: Option<String>,
     /// Extension beyond the base OIDC parameter set: a mock IdP has no real
     /// browser session to consult, so `prompt=none`'s "is there an active
@@ -91,10 +93,25 @@ pub async fn authorize(
         );
     }
 
-    let requested_subject = params
-        .login_as
+    let prompt_none = params
+        .prompt
         .as_deref()
-        .unwrap_or(&state.default_user().subject);
+        .map(|prompt| prompt.split_whitespace().any(|value| value == "none"))
+        .unwrap_or(false);
+
+    let requested_subject = match params.login_as.as_deref() {
+        Some(subject) => subject,
+        None if state.users.len() == 1 => &state.default_user().subject,
+        None if prompt_none => {
+            return redirect_error(
+                redirect_uri,
+                state_param,
+                "login_required",
+                "several users are configured and login_as was not given",
+            );
+        }
+        None => return chooser(&state, &params),
+    };
     let Some(user) = state.find_user(requested_subject) else {
         return redirect_error(
             redirect_uri,
@@ -104,11 +121,6 @@ pub async fn authorize(
         );
     };
 
-    let prompt_none = params
-        .prompt
-        .as_deref()
-        .map(|prompt| prompt.split_whitespace().any(|value| value == "none"))
-        .unwrap_or(false);
     if prompt_none && !params.active_session.unwrap_or(true) {
         return redirect_error(
             redirect_uri,
@@ -135,6 +147,62 @@ pub async fn authorize(
     );
 
     redirect_ok(redirect_uri, state_param, &code)
+}
+
+/// The user chooser: one link per configured user, each the validated
+/// request again with `login_as` set. Everything interpolated is
+/// percent-encoded into the href or HTML-escaped into the text.
+fn chooser(state: &SharedState, params: &AuthorizeParams) -> Response {
+    let mut items = String::new();
+    for user in &state.users {
+        let mut link = Url::parse("http://mock-idp.invalid/authorize").expect("static URL");
+        {
+            let mut pairs = link.query_pairs_mut();
+            let fields = [
+                ("response_type", &params.response_type),
+                ("client_id", &params.client_id),
+                ("redirect_uri", &params.redirect_uri),
+                ("scope", &params.scope),
+                ("state", &params.state),
+                ("code_challenge", &params.code_challenge),
+                ("code_challenge_method", &params.code_challenge_method),
+                ("nonce", &params.nonce),
+                ("prompt", &params.prompt),
+            ];
+            for (key, value) in fields {
+                if let Some(value) = value {
+                    pairs.append_pair(key, value);
+                }
+            }
+            pairs.append_pair("login_as", &user.subject);
+        }
+        let href = format!("/authorize?{}", link.query().unwrap_or_default());
+        items.push_str(&format!(
+            "<li><a href=\"{}\">{}</a> ({}, {})</li>",
+            escape(&href),
+            escape(&user.name),
+            escape(&user.subject),
+            escape(&user.email),
+        ));
+    }
+    let page = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>mock-idp: sign in as</title>\
+         <h1>mock-idp: sign in as</h1><ul>{items}</ul>"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        page,
+    )
+        .into_response()
+}
+
+fn escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn bad_request(message: &str) -> Response {
