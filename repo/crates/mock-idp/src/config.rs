@@ -72,8 +72,8 @@ impl Default for MockIdpConfig {
 
 /// CLI/env surface for the `mock-idp` binary.
 ///
-/// Only a single client and a single user can be configured this way; a
-/// library caller that needs several of either builds [`MockIdpConfig`]
+/// Only a single client can be configured this way (any number of users);
+/// a library caller that needs several clients builds [`MockIdpConfig`]
 /// directly instead of going through here.
 #[derive(Debug, Parser)]
 #[command(
@@ -101,14 +101,18 @@ pub struct Cli {
     )]
     pub redirect_uris: Vec<String>,
 
-    #[arg(long, env = "MOCK_IDP_SUBJECT", default_value = "user-1")]
-    pub subject: String,
-
-    #[arg(long, env = "MOCK_IDP_EMAIL", default_value = "dev.user@example.test")]
-    pub email: String,
-
-    #[arg(long, env = "MOCK_IDP_NAME", default_value = "Dev User")]
-    pub name: String,
+    /// Canned users, each `subject|email|name`. Repeat `--user`, or give
+    /// `MOCK_IDP_USERS` as a `;`-separated list. The first user is the one
+    /// `/authorize` logs in when `login_as` is omitted and only one user is
+    /// configured; with several, `/authorize` shows a chooser instead.
+    #[arg(
+        long = "user",
+        env = "MOCK_IDP_USERS",
+        default_value = "user-1|dev.user@example.test|Dev User",
+        value_delimiter = ';',
+        value_parser = parse_user
+    )]
+    pub users: Vec<UserConfig>,
 
     #[arg(long, env = "MOCK_IDP_ACCESS_TOKEN_TTL_SECS", default_value_t = 300)]
     pub access_token_ttl_secs: u64,
@@ -141,16 +145,72 @@ impl From<Cli> for MockIdpConfig {
                 client_secret: Some(cli.client_secret),
                 redirect_uris: cli.redirect_uris,
             }],
-            users: vec![UserConfig {
-                subject: cli.subject,
-                email: cli.email,
-                name: cli.name,
-            }],
+            users: cli.users,
             access_token_ttl_secs: cli.access_token_ttl_secs,
             refresh_token_ttl_secs: cli.refresh_token_ttl_secs,
             rotate_refresh_tokens: cli.rotate_refresh_tokens,
             authorization_code_ttl_secs: cli.authorization_code_ttl_secs,
             rsa_seed: cli.rsa_seed,
         }
+    }
+}
+
+/// Parse one `subject|email|name` user. All three parts must be non-empty;
+/// `name` may itself contain `|` (everything after the second one).
+fn parse_user(raw: &str) -> Result<UserConfig, String> {
+    let mut parts = raw.splitn(3, '|').map(str::trim);
+    let (Some(subject), Some(email), Some(name)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(format!("user {raw:?} must be subject|email|name"));
+    };
+    if subject.is_empty() || email.is_empty() || name.is_empty() {
+        return Err(format!("user {raw:?} has an empty subject, email or name"));
+    }
+    Ok(UserConfig {
+        subject: subject.to_owned(),
+        email: email.to_owned(),
+        name: name.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_user() {
+        let user = parse_user("alice|alice@example.test|Alice Analyst").unwrap();
+        assert_eq!(user.subject, "alice");
+        assert_eq!(user.email, "alice@example.test");
+        assert_eq!(user.name, "Alice Analyst");
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_parts() {
+        assert!(parse_user("alice|alice@example.test").is_err());
+        assert!(parse_user("alice||Alice").is_err());
+        assert!(parse_user("|a@example.test|Alice").is_err());
+    }
+
+    #[test]
+    fn default_cli_is_the_single_user_setup() {
+        let cli = Cli::parse_from(["mock-idp"]);
+        let config: MockIdpConfig = cli.into();
+        assert_eq!(config.users.len(), 1);
+        assert_eq!(config.users[0].subject, "user-1");
+    }
+
+    #[test]
+    fn repeated_user_flags_build_several_users() {
+        let cli = Cli::parse_from([
+            "mock-idp",
+            "--user",
+            "alice|a@example.test|Alice",
+            "--user",
+            "bob|b@example.test|Bob",
+        ]);
+        let config: MockIdpConfig = cli.into();
+        let subjects: Vec<_> = config.users.iter().map(|u| u.subject.as_str()).collect();
+        assert_eq!(subjects, ["alice", "bob"]);
     }
 }

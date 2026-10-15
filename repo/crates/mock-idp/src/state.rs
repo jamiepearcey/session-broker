@@ -192,6 +192,13 @@ impl AppState {
             !config.users.is_empty(),
             "mock-idp needs at least one canned user"
         );
+        for (i, user) in config.users.iter().enumerate() {
+            anyhow::ensure!(
+                !config.users[..i].iter().any(|u| u.subject == user.subject),
+                "duplicate canned user subject {:?}",
+                user.subject
+            );
+        }
 
         let clients = config
             .clients
