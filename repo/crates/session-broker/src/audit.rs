@@ -60,6 +60,9 @@ pub mod action {
     pub const PRINCIPAL_SECRET_REVOKED: &str = "principal.secret_revoked";
     pub const USER_GRANT_CREATED: &str = "user_grant.created";
     pub const USER_GRANT_REVOKED: &str = "user_grant.revoked";
+    pub const PROVIDER_CREATED: &str = "provider.created";
+    pub const PROVIDER_UPDATED: &str = "provider.updated";
+    pub const PROVIDER_DELETED: &str = "provider.deleted";
 
     // Tier B — batched, fail-open.
     pub const SESSION_CREATED: &str = "session.created";

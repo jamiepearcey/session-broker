@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use crate::clock::{Clock, Timestamp};
 use crate::keepalive::{RefreshOutcome, Upstream};
-use crate::oauth::{OidcClient, RefreshGrantError};
+use crate::oauth::RefreshGrantError;
+use crate::providers::{ProviderRegistry, RefreshClient};
 use crate::session::{CustodyId, CustodyStatus};
 use crate::store::repo::{self, CustodyRow};
 use crate::store::writer::{CustodyWrite, WriterHandle};
@@ -51,6 +52,7 @@ pub struct NewGrant {
     pub access_token: String,
     pub access_exp: Timestamp,
     pub scope: Option<String>,
+    pub provider_id: String,
 }
 
 impl std::fmt::Debug for NewGrant {
@@ -61,6 +63,7 @@ impl std::fmt::Debug for NewGrant {
             .field("access_token", &"redacted")
             .field("access_exp", &self.access_exp)
             .field("scope", &self.scope)
+            .field("provider_id", &self.provider_id)
             .finish()
     }
 }
@@ -128,6 +131,7 @@ impl CustodySink {
             ),
             fail_count: 0,
             updated_at: now,
+            provider_id: grant.provider_id.clone(),
         }))?;
 
         // The worker is the only owner of the schedule, so a send failure means
@@ -152,9 +156,10 @@ impl CustodySink {
     }
 }
 
-/// The production [`Upstream`]: refresh-token grant against the configured IdP.
+/// The production [`Upstream`]: refresh-token grant against the IdP that issued
+/// the grant, whichever that is.
 pub struct OidcUpstream {
-    oidc: Arc<OidcClient>,
+    providers: Arc<ProviderRegistry>,
     reader: Arc<Reader>,
     writer: WriterHandle,
     clock: Arc<dyn Clock>,
@@ -162,13 +167,13 @@ pub struct OidcUpstream {
 
 impl OidcUpstream {
     pub fn new(
-        oidc: Arc<OidcClient>,
+        providers: Arc<ProviderRegistry>,
         reader: Arc<Reader>,
         writer: WriterHandle,
         clock: Arc<dyn Clock>,
     ) -> OidcUpstream {
         OidcUpstream {
-            oidc,
+            providers,
             reader,
             writer,
             clock,
@@ -208,8 +213,34 @@ impl Upstream for OidcUpstream {
             return RefreshOutcome::Permanent;
         };
 
+        // A disabled provider still renews: disabling starts no new login, and
+        // what happens to existing sessions is decided by the IdP's answer and
+        // the upstream-revoked policy. A deleted one cannot ever renew.
+        let oidc = match self.providers.client_for_refresh(&row.provider_id).await {
+            RefreshClient::Ready(client) => client,
+            RefreshClient::Gone => {
+                tracing::warn!(
+                    custody = %custody.0,
+                    provider = %row.provider_id,
+                    "the provider that issued this grant was deleted"
+                );
+                return RefreshOutcome::Permanent;
+            }
+            RefreshClient::Unavailable(reason) => {
+                tracing::warn!(
+                    custody = %custody.0,
+                    provider = %row.provider_id,
+                    %reason,
+                    "the provider that issued this grant is unavailable; will retry"
+                );
+                return RefreshOutcome::Transient {
+                    retry_after_secs: None,
+                };
+            }
+        };
+
         let now = self.clock.now();
-        let grant = match self.oidc.refresh_grant(&refresh_token, now).await {
+        let grant = match oidc.refresh_grant(&refresh_token, now).await {
             Ok(grant) => grant,
             Err(RefreshGrantError::Transient(e)) => {
                 tracing::warn!(custody = %custody.0, error = %e, "upstream refresh failed; will retry");

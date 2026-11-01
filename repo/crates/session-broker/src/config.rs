@@ -437,7 +437,7 @@ pub struct OidcConfig {
 pub struct ClientSecret(String);
 
 impl ClientSecret {
-    fn new(value: String) -> ClientSecret {
+    pub(crate) fn new(value: String) -> ClientSecret {
         ClientSecret(value)
     }
 

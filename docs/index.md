@@ -31,6 +31,7 @@ Read these files before making changes:
 - [ADR-0015: The audit record is a table in the broker's own store, kept for a bounded window and surfaced in the console](decisions/ADR-0015-durable-audit-record-with-retention.md)
 - [ADR-0016: Production hardening — rate limits, transport limits, graceful drain, readiness, rotatable custody keyring](decisions/ADR-0016-production-hardening.md)
 - [ADR-0017: The broker becomes a token issuer — signed tokens for people and machines](decisions/ADR-0017-the-broker-as-a-token-issuer.md)
+- [ADR-0018: Identity providers are data, managed from the admin lane](decisions/ADR-0018-identity-providers-as-data.md)
 
 ## Verifying issued tokens
 

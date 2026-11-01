@@ -899,6 +899,7 @@ mod tests {
                     next_refresh: T0.plus_secs(60),
                     fail_count: 0,
                     updated_at: T0,
+                    provider_id: "default".to_owned(),
                 },
             ))
             .unwrap();

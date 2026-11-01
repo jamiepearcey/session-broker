@@ -36,6 +36,7 @@ pub enum RepoError {
 // substitution.
 use super::crypto::{context, key_id_of, KeyRing};
 pub(crate) use super::crypto::{open, seal};
+use crate::config::ClientSecret;
 
 // ---------------------------------------------------------------------
 // Status <-> TEXT column mapping. Kept local to the SQL boundary rather
@@ -106,13 +107,15 @@ pub struct CustodyRow {
     pub next_refresh: Timestamp,
     pub fail_count: i64,
     pub updated_at: Timestamp,
+    /// The provider that issued this grant, and so the only one that can renew it.
+    pub provider_id: String,
 }
 
 pub fn insert_custody(conn: &Connection, row: &CustodyRow) -> Result<(), RepoError> {
     conn.execute(
         "INSERT INTO custody
-            (custody_id, sub, refresh_tok, access_tok, access_exp, scope, status, next_refresh, fail_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (custody_id, sub, refresh_tok, access_tok, access_exp, scope, status, next_refresh, fail_count, updated_at, provider_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             row.custody_id.0,
             row.sub,
@@ -124,6 +127,7 @@ pub fn insert_custody(conn: &Connection, row: &CustodyRow) -> Result<(), RepoErr
             row.next_refresh.secs(),
             row.fail_count,
             row.updated_at.secs(),
+            row.provider_id,
         ],
     )?;
     Ok(())
@@ -166,12 +170,14 @@ pub fn reseal_all(conn: &Connection) -> Result<ResealAll, RepoError> {
 pub struct ResealAll {
     pub custody: ResealReport,
     pub signing_keys: ResealReport,
+    pub identity_providers: ResealReport,
 }
 
 pub(crate) fn reseal_all_with(conn: &Connection, ring: &KeyRing) -> Result<ResealAll, RepoError> {
     Ok(ResealAll {
         custody: reseal_custody_with(conn, ring)?,
         signing_keys: reseal_signing_keys_with(conn, ring)?,
+        identity_providers: reseal_providers_with(conn, ring)?,
     })
 }
 
@@ -227,7 +233,7 @@ pub fn load_custody(
 ) -> Result<Option<CustodyRow>, RepoError> {
     let raw = conn
         .query_row(
-            "SELECT custody_id, sub, refresh_tok, access_tok, access_exp, scope, status, next_refresh, fail_count, updated_at
+            "SELECT custody_id, sub, refresh_tok, access_tok, access_exp, scope, status, next_refresh, fail_count, updated_at, provider_id
              FROM custody WHERE custody_id = ?1",
             params![custody_id.0],
             |r| {
@@ -242,6 +248,7 @@ pub fn load_custody(
                     r.get::<_, i64>(7)?,
                     r.get::<_, i64>(8)?,
                     r.get::<_, i64>(9)?,
+                    r.get::<_, String>(10)?,
                 ))
             },
         )
@@ -258,6 +265,7 @@ pub fn load_custody(
         next_refresh,
         fail_count,
         updated_at,
+        provider_id,
     )) = raw
     else {
         return Ok(None);
@@ -278,6 +286,7 @@ pub fn load_custody(
         next_refresh: Timestamp(next_refresh),
         fail_count,
         updated_at: Timestamp(updated_at),
+        provider_id,
     }))
 }
 
@@ -616,6 +625,300 @@ pub(crate) fn reseal_signing_keys_with(
                     params![ring.seal(&seed, &ctx), kid],
                 )?;
                 zeroize::Zeroize::zeroize(&mut seed);
+                report.resealed += 1;
+            }
+            Err(_) => report.failed += 1,
+        }
+    }
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------
+// identity_provider (v6) — OIDC providers managed from the admin lane
+//
+// The client secret is sealed on the way in and opened on the way out. Nothing
+// above the registry and the admin handlers ever sees it, and they only ever
+// hold it as a `ClientSecret`, whose Debug is redacted.
+// ---------------------------------------------------------------------
+
+fn provider_secret_context(id: &str) -> Vec<u8> {
+    format!("provider:{id}:client_secret").into_bytes()
+}
+
+/// A provider row, tombstones included, with its secret opened.
+#[derive(Debug, Clone)]
+pub struct ProviderRow {
+    pub id: String,
+    pub preset: String,
+    pub display_name: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    /// `None` on a tombstone, and on a live row whose seal would not open (the
+    /// keyfile lost its key): that provider stays listed and cannot log anyone
+    /// in, rather than stopping the broker from booting.
+    pub client_secret: Option<ClientSecret>,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub deleted_at: Option<Timestamp>,
+}
+
+/// What a create writes.
+#[derive(Debug, Clone)]
+pub struct NewProvider {
+    pub id: String,
+    pub preset: String,
+    pub display_name: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    pub client_secret: ClientSecret,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+}
+
+/// What an update writes. `client_secret: None` leaves the sealed value alone.
+#[derive(Debug, Clone)]
+pub struct ProviderUpdate {
+    pub id: String,
+    pub preset: String,
+    pub display_name: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    pub client_secret: Option<ClientSecret>,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+}
+
+/// Create a provider, or revive a tombstone of the SAME issuer. `Ok(false)`: the
+/// id is taken, by a live row or by a tombstone of a different issuer.
+pub fn insert_provider(
+    conn: &Connection,
+    p: &NewProvider,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "INSERT INTO identity_provider
+            (id, preset, display_name, issuer_url, client_id, client_secret_sealed, scopes, enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+            preset = excluded.preset,
+            display_name = excluded.display_name,
+            client_id = excluded.client_id,
+            client_secret_sealed = excluded.client_secret_sealed,
+            scopes = excluded.scopes,
+            enabled = excluded.enabled,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            deleted_at = NULL
+         WHERE identity_provider.deleted_at IS NOT NULL
+           AND identity_provider.issuer_url = excluded.issuer_url",
+        params![
+            p.id,
+            p.preset,
+            p.display_name,
+            p.issuer_url,
+            p.client_id,
+            seal(
+                p.client_secret.expose().as_bytes(),
+                &provider_secret_context(&p.id)
+            ),
+            serde_json::to_string(&p.scopes).unwrap_or_else(|_| "[]".to_owned()),
+            p.enabled,
+            now.secs(),
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn update_provider(
+    conn: &Connection,
+    p: &ProviderUpdate,
+    now: Timestamp,
+) -> Result<bool, RepoError> {
+    let sealed = p
+        .client_secret
+        .as_ref()
+        .map(|s| seal(s.expose().as_bytes(), &provider_secret_context(&p.id)));
+    let changed = conn.execute(
+        "UPDATE identity_provider SET
+            preset = ?2, display_name = ?3, issuer_url = ?4, client_id = ?5,
+            client_secret_sealed = COALESCE(?6, client_secret_sealed),
+            scopes = ?7, enabled = ?8, updated_at = ?9
+         WHERE id = ?1 AND deleted_at IS NULL",
+        params![
+            p.id,
+            p.preset,
+            p.display_name,
+            p.issuer_url,
+            p.client_id,
+            sealed,
+            serde_json::to_string(&p.scopes).unwrap_or_else(|_| "[]".to_owned()),
+            p.enabled,
+            now.secs(),
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Tombstone a provider and destroy its secret.
+pub fn delete_provider(conn: &Connection, id: &str, now: Timestamp) -> Result<bool, RepoError> {
+    let changed = conn.execute(
+        "UPDATE identity_provider
+         SET deleted_at = ?2, updated_at = ?2, enabled = 0, client_secret_sealed = x''
+         WHERE id = ?1 AND deleted_at IS NULL",
+        params![id, now.secs()],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn list_providers(conn: &Connection) -> Result<Vec<ProviderRow>, RepoError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, preset, display_name, issuer_url, client_id, client_secret_sealed, scopes,
+                enabled, created_at, updated_at, deleted_at
+         FROM identity_provider ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Vec<u8>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, bool>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, i64>(9)?,
+                r.get::<_, Option<i64>>(10)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (
+        id,
+        preset,
+        display_name,
+        issuer_url,
+        client_id,
+        sealed,
+        scopes,
+        enabled,
+        created_at,
+        updated_at,
+        deleted_at,
+    ) in rows
+    {
+        let client_secret = if deleted_at.is_some() {
+            None
+        } else {
+            match open(&sealed, &provider_secret_context(&id)) {
+                Ok(mut plain) => {
+                    let secret = String::from_utf8(plain.clone()).ok().map(ClientSecret::new);
+                    zeroize::Zeroize::zeroize(&mut plain);
+                    secret
+                }
+                Err(_) => {
+                    tracing::error!(provider = %id, "provider client secret could not be opened");
+                    None
+                }
+            }
+        };
+        out.push(ProviderRow {
+            scopes: json_list(scopes, "identity_provider.scopes")?,
+            id,
+            preset,
+            display_name,
+            issuer_url,
+            client_id,
+            client_secret,
+            enabled,
+            created_at: Timestamp(created_at),
+            updated_at: Timestamp(updated_at),
+            deleted_at: deleted_at.map(Timestamp),
+        });
+    }
+    Ok(out)
+}
+
+/// Does anyone already answer to `<id>|...`? True once a grant (live or revoked)
+/// or a held upstream grant carries that spelling. While it is true the id must
+/// not start meaning a different issuer: those grants would move to whoever that
+/// issuer calls by the same subject.
+pub fn provider_namespace_in_use(conn: &Connection, id: &str) -> Result<bool, RepoError> {
+    let found: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM custody
+                        WHERE provider_id = ?1 OR substr(sub, 1, length(?1) + 1) = ?1 || '|')
+             OR EXISTS (SELECT 1 FROM user_grant
+                        WHERE substr(sub, 1, length(?1) + 1) = ?1 || '|')",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(found)
+}
+
+/// A person seen through a provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderPerson {
+    pub sub: String,
+    pub last_seen: Timestamp,
+    pub custodies: i64,
+}
+
+/// People with an upstream grant still held under a provider, newest first.
+pub fn provider_people(
+    conn: &Connection,
+    id: &str,
+    limit: i64,
+) -> Result<Vec<ProviderPerson>, RepoError> {
+    let mut stmt = conn.prepare(
+        "SELECT sub, MAX(updated_at), COUNT(*) FROM custody WHERE provider_id = ?1
+         GROUP BY sub ORDER BY MAX(updated_at) DESC, sub LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![id, limit], |r| {
+            Ok(ProviderPerson {
+                sub: r.get(0)?,
+                last_seen: Timestamp(r.get(1)?),
+                custodies: r.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Tombstones have nothing sealed, so they are not visited.
+pub(crate) fn reseal_providers_with(
+    conn: &Connection,
+    ring: &KeyRing,
+) -> Result<ResealReport, RepoError> {
+    let active = ring.active_id();
+    let mut report = ResealReport::default();
+    let mut stmt = conn.prepare(
+        "SELECT id, client_secret_sealed FROM identity_provider WHERE deleted_at IS NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (id, sealed) in rows {
+        if key_id_of(&sealed) == Some(active) {
+            report.current += 1;
+            continue;
+        }
+        let ctx = provider_secret_context(&id);
+        match ring.open(&sealed, &ctx) {
+            Ok(mut plain) => {
+                conn.execute(
+                    "UPDATE identity_provider SET client_secret_sealed = ?1 WHERE id = ?2",
+                    params![ring.seal(&plain, &ctx), id],
+                )?;
+                zeroize::Zeroize::zeroize(&mut plain);
                 report.resealed += 1;
             }
             Err(_) => report.failed += 1,
@@ -1251,8 +1554,9 @@ pub struct SessionRow {
 pub fn insert_session(conn: &Connection, row: &SessionRow) -> Result<(), RepoError> {
     conn.execute(
         "INSERT INTO session
-            (sid, custody_id, sub, current_gen, idle_exp, absolute_exp, status, created_at, meta)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            (sid, custody_id, sub, current_gen, idle_exp, absolute_exp, status, created_at, meta, provider_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                 COALESCE((SELECT provider_id FROM custody WHERE custody_id = ?2), 'default'))",
         params![
             row.sid.0,
             row.custody_id.0,
@@ -1865,6 +2169,7 @@ mod tests {
             next_refresh: now.plus_secs(1800),
             fail_count: 0,
             updated_at: now,
+            provider_id: "default".to_owned(),
         }
     }
 

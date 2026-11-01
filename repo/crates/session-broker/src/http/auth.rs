@@ -6,7 +6,7 @@
 //! `http::router(state)`'s signature is fixed — dozens of existing tests
 //! call it with nothing but an `AppState`, and `AppState` itself carries no
 //! OIDC client (nor may it gain one for this milestone). Rather than
-//! changing either, the two handlers below take their `Arc<OidcClient>` as
+//! changing either, the handlers below take their `Arc<ProviderRegistry>` as
 //! an axum request [`Extension`] instead of a second `State`: extensions are
 //! populated by a `tower::Layer`, which can be applied to the already-built
 //! router from *outside* `http::router`, so none of the existing state
@@ -15,7 +15,7 @@
 //!
 //! ```ignore
 //! let app = session_broker::http::router(state)
-//!     .layer(axum::extract::Extension(Arc::new(oidc_client)));
+//!     .layer(axum::extract::Extension(Arc::new(provider_registry)));
 //! ```
 //!
 //! Every other route ignores the extension; only these two extract it, so
@@ -27,18 +27,78 @@ use std::sync::Arc;
 use axum::extract::{Extension, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use axum::Json;
+use serde::{Deserialize, Serialize};
 
 use super::error::{ApiError, ErrorCode};
 use super::guards;
 use super::{AppState, HttpConfig};
 use crate::clock::Timestamp;
-use crate::oauth::{random_id, OauthError, OidcClient, UpstreamTokens, TXN_TTL_SECS};
+use crate::oauth::{random_id, OauthError, UpstreamTokens, DEFAULT_PROVIDER, TXN_TTL_SECS};
+use crate::providers::{LoginRefusal, ProviderRegistry};
 use crate::session::{CustodyId, Sid};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct LoginQuery {
     return_to: Option<String>,
+    /// Which provider. Optional while exactly one is enabled.
+    provider: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderChoice {
+    id: String,
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderChoices {
+    providers: Vec<ProviderChoice>,
+}
+
+/// `GET /auth/providers` — the enabled providers, for a sign-in chooser. Public
+/// on purpose: a login page has to render before anyone has signed in, and an id
+/// and a display name are what that page would show anyway.
+pub async fn providers(Extension(registry): Extension<Arc<ProviderRegistry>>) -> Response {
+    let providers = registry
+        .enabled()
+        .into_iter()
+        .map(|(id, display_name)| ProviderChoice { id, display_name })
+        .collect();
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ProviderChoices { providers }),
+    )
+        .into_response()
+}
+
+fn login_refusal(refusal: LoginRefusal) -> Response {
+    let (code, detail) = match refusal {
+        LoginRefusal::NoProviders => (
+            ErrorCode::NoProviders,
+            "No identity provider is enabled on this broker.".to_owned(),
+        ),
+        LoginRefusal::Required => (
+            ErrorCode::ProviderRequired,
+            "Several identity providers are enabled: choose one from /auth/providers and pass it as ?provider=.".to_owned(),
+        ),
+        LoginRefusal::Unknown => (
+            ErrorCode::UnknownProvider,
+            "No identity provider has that id.".to_owned(),
+        ),
+        LoginRefusal::Disabled => (
+            ErrorCode::ProviderDisabled,
+            "That identity provider is disabled.".to_owned(),
+        ),
+        LoginRefusal::Unavailable(failure) => {
+            tracing::warn!(error = %failure, "login refused: provider discovery failed");
+            (
+                ErrorCode::ProviderUnavailable,
+                format!("The identity provider could not be reached ({}).", failure.failure),
+            )
+        }
+    };
+    ApiError::new(code, detail).into_response()
 }
 
 /// `GET /auth/login?return_to=/path` — validates `return_to` (INV-4, via the
@@ -47,7 +107,7 @@ pub struct LoginQuery {
 pub async fn login(
     State(state): State<AppState>,
     crate::http::guards::PeerAddr(peer): crate::http::guards::PeerAddr,
-    Extension(oidc): Extension<Arc<OidcClient>>,
+    Extension(registry): Extension<Arc<ProviderRegistry>>,
     Query(query): Query<LoginQuery>,
     headers: HeaderMap,
 ) -> Response {
@@ -80,6 +140,11 @@ pub async fn login(
         }
     }
 
+    let oidc = match registry.client_for_login(query.provider.as_deref()).await {
+        Ok(oidc) => oidc,
+        Err(refusal) => return login_refusal(refusal),
+    };
+
     let now = state.clock.now();
     let (authorize_url, txn) = oidc.begin_login(return_to, now);
 
@@ -96,6 +161,8 @@ pub struct CallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+    /// RFC 9207. Not every provider sends it; when one does it must match.
+    iss: Option<String>,
 }
 
 /// `GET /auth/callback?code=&state=` (and the `?error=` form). Any failure —
@@ -107,7 +174,7 @@ pub struct CallbackQuery {
 /// `return_to`.
 pub async fn callback(
     State(state): State<AppState>,
-    Extension(oidc): Extension<Arc<OidcClient>>,
+    Extension(registry): Extension<Arc<ProviderRegistry>>,
     Query(query): Query<CallbackQuery>,
     headers: HeaderMap,
 ) -> Response {
@@ -122,7 +189,7 @@ pub async fn callback(
             record_login_failure(&state, "no_txn_cookie", now);
             error_redirect(&state.config)
         }
-        Some(id) => match resolve(&oidc, id, &query, now).await {
+        Some(id) => match resolve(&registry, id, &query, now).await {
             Ok((tokens, return_to)) => success_response(&state, tokens, return_to, now),
             Err(error) => {
                 tracing::warn!(%error, "oauth callback failed");
@@ -143,11 +210,27 @@ pub async fn callback(
 /// touch, success or failure alike) — every early-return path here still
 /// consumes the txn before giving up.
 async fn resolve(
-    oidc: &OidcClient,
+    registry: &ProviderRegistry,
     txn_id: &str,
     query: &CallbackQuery,
     now: Timestamp,
 ) -> Result<(UpstreamTokens, Option<String>), OauthError> {
+    // The server's own record says which provider this login belongs to. Nothing
+    // the browser sends can steer the exchange at another one.
+    let provider_id = registry
+        .txn_provider(txn_id)
+        .ok_or(OauthError::UnknownTxn)?;
+    let oidc = match registry.client_for_callback(&provider_id).await {
+        Ok(oidc) => oidc,
+        Err(error) => {
+            registry.discard_txn(txn_id);
+            return Err(error);
+        }
+    };
+    if query.iss.as_deref().is_some_and(|iss| iss != oidc.issuer()) {
+        oidc.discard_txn(txn_id);
+        return Err(OauthError::IssuerMismatch);
+    }
     if let Some(error) = &query.error {
         oidc.discard_txn(txn_id);
         return Err(OauthError::ProviderError(error.clone()));
@@ -158,7 +241,13 @@ async fn resolve(
             "callback is missing code or state".to_owned(),
         ));
     };
-    oidc.complete_login(txn_id, state_param, code, now).await
+    let (tokens, return_to) = oidc.complete_login(txn_id, state_param, code, now).await?;
+    // The config provider keeps the upstream spelling, so an upstream sub of
+    // `entra|123` there would BE provider `entra`'s person 123.
+    if tokens.provider_id == DEFAULT_PROVIDER && registry.subject_collides(&tokens.sub) {
+        return Err(OauthError::SubjectCollision);
+    }
+    Ok((tokens, return_to))
 }
 
 fn success_response(
@@ -189,6 +278,7 @@ fn success_response(
             access_token: tokens.access_token.clone(),
             access_exp: tokens.expires_at,
             scope: tokens.scope.clone(),
+            provider_id: tokens.provider_id.clone(),
         };
         if let Err(e) = sink.take_custody(&custody, &grant, now) {
             tracing::error!(error = %e, "could not take custody of the upstream grant; refusing the login");
@@ -210,7 +300,8 @@ fn success_response(
             )
             .subject(tokens.sub.clone())
             .sid(sid.0.clone())
-            .custody_id(custody.0.clone()),
+            .custody_id(custody.0.clone())
+            .detail(serde_json::json!({ "provider": tokens.provider_id })),
         );
     }
 
@@ -320,6 +411,7 @@ mod tests {
 
     use super::*;
     use crate::clock::TestClock;
+    use crate::oauth::OidcClient;
     use crate::session::{SessionMap, SessionPolicy};
 
     const T0: Timestamp = Timestamp(1_700_000_000);
@@ -360,7 +452,9 @@ mod tests {
                 rate_limit: None,
                 issuer: None,
             };
-            let router = crate::http::router(state).layer(Extension(Arc::new(oidc)));
+            let router = crate::http::router(state).layer(Extension(Arc::new(
+                ProviderRegistry::with_default_client(oidc, REDIRECT_URI),
+            )));
 
             Harness {
                 router,

@@ -51,11 +51,11 @@ const KINDS: [&str; 5] = ["ingest", "node", "replica", "reader", "admin"];
 
 // --- shared helpers -----------------------------------------------------
 
-fn bad(error: &'static str, detail: &'static str) -> Response {
+pub(super) fn bad(error: &'static str, detail: &'static str) -> Response {
     refuse(StatusCode::BAD_REQUEST, error, detail)
 }
 
-fn store_failed(what: &'static str, e: impl std::fmt::Display) -> Response {
+pub(super) fn store_failed(what: &'static str, e: impl std::fmt::Display) -> Response {
     tracing::error!(error = %e, "admin: {what}");
     refuse(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -64,7 +64,7 @@ fn store_failed(what: &'static str, e: impl std::fmt::Display) -> Response {
     )
 }
 
-fn parse<T: DeserializeOwned>(body: &Bytes) -> Result<T, Box<Response>> {
+pub(super) fn parse<T: DeserializeOwned>(body: &Bytes) -> Result<T, Box<Response>> {
     serde_json::from_slice(body).map_err(|_| {
         Box::new(bad(
             "bad_request",
@@ -83,7 +83,7 @@ fn parse_optional<T: DeserializeOwned + Default>(body: &Bytes) -> Result<T, Box<
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,62}$`.
-fn is_slug(s: &str) -> bool {
+pub(super) fn is_slug(s: &str) -> bool {
     let b = s.as_bytes();
     (1..=63).contains(&b.len())
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
@@ -99,7 +99,7 @@ fn is_word(s: &str) -> bool {
 
 /// Validate and de-duplicate a list of words, keeping the first occurrence's
 /// position. `None` if it is empty, too long, or holds a bad item.
-fn clean_list(items: Vec<String>) -> Option<Vec<String>> {
+pub(super) fn clean_list(items: Vec<String>) -> Option<Vec<String>> {
     let mut out: Vec<String> = Vec::with_capacity(items.len());
     for item in items {
         if !is_word(&item) {
@@ -124,13 +124,17 @@ fn tenant_or_default(tenant: Option<String>) -> Result<String, Box<Response>> {
     }
 }
 
-fn admin_event(action: &str, now: Timestamp) -> Event {
+pub(super) fn admin_event(action: &str, now: Timestamp) -> Event {
     Event::new(action, Outcome::Success, ActorKind::Admin, now).actor_id(ADMIN_ACTOR)
 }
 
 /// Run one mutation with its Tier A row in the same transaction. `Ok(false)` is
 /// "nothing to act on" (or, for a create, "already there").
-fn apply(state: &AdminState, write: AdminWrite, event: Event) -> Result<bool, Box<Response>> {
+pub(super) fn apply(
+    state: &AdminState,
+    write: AdminWrite,
+    event: Event,
+) -> Result<bool, Box<Response>> {
     let audit_row = state.audit.as_ref().map(|sink| sink.transactional(event));
     state
         .writer
@@ -911,12 +915,13 @@ pub(super) async fn create_user_grant(
         Err(response) => return *response,
     };
     if request.sub.is_empty()
-        || request.sub.len() > 256
+        // A registry person is `<provider>|<upstream sub>`: 63 + 1 + the 255 OIDC allows.
+        || request.sub.len() > 320
         || request.sub.chars().any(char::is_control)
     {
         return bad(
             "invalid_sub",
-            "sub is 1 to 256 characters with no control characters.",
+            "sub is 1 to 320 characters with no control characters.",
         );
     }
     let Some(roles) = clean_list(request.roles) else {

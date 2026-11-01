@@ -134,6 +134,7 @@ a breaking change to whatever is alerting on it.
 | `principal.created` / `principal.revoked` | `admin` | A service principal is created (with its first secret) or revoked. `key_id` carries the `sp_` id; never a secret. |
 | `principal.secret_added` / `principal.secret_revoked` | `admin` | A principal secret is added or revoked. `key_id` carries the principal id; `detail` the secret id. |
 | `user_grant.created` / `user_grant.revoked` | `admin` | A user grant is created (or revived) or revoked. `subject` carries the `sub`. |
+| `provider.created` / `provider.updated` / `provider.deleted` | `admin` | An identity provider changed. `detail` carries its id, preset, issuer, client id, scopes, enabled and `secret_changed`; never the secret. |
 | `signing_key.created` / `signing_key.rotated` / `signing_key.removed` | `system` / `admin` / `system` | A signing key is created at first boot, rotated by an operator, or removed after its retire date. `key_id` carries the `kid`; never the seed. |
 
 ### Tier B — batched, fail-open, depth-bounded

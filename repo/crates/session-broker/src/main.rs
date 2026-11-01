@@ -34,7 +34,7 @@ use session_broker::http::events::SessionEvents;
 use session_broker::http::internal::InternalState;
 use session_broker::http::{self, AppState, HttpConfig};
 use session_broker::keepalive::{KeepalivePolicy, KeepaliveWorker, RandJitter};
-use session_broker::oauth::OidcClient;
+use session_broker::providers::ProviderRegistry;
 use session_broker::session::{Generation, RestoredSession, SessionMap};
 use session_broker::store::{self, writer::Writer, Reader};
 use session_broker::token::TokenHash;
@@ -174,17 +174,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events = SessionEvents::new();
     sessions.set_observer(events.clone());
 
-    let oidc = Arc::new(OidcClient::discover(&config.oidc).await?);
+    // The config-file provider is discovered now and a failure there stops the
+    // boot, as it always has. Providers from the store connect on first use, so
+    // one unreachable IdP cannot keep the broker down. No provider at all is a
+    // valid boot: login answers `no_providers` by name.
+    let redirect_uri = config
+        .oidc
+        .redirect_uri
+        .clone()
+        .unwrap_or_else(|| format!("{}/auth/callback", config.base_url.trim_end_matches('/')));
+    let provider_rows = reader.with(session_broker::store::repo::list_providers)?;
+    let providers =
+        Arc::new(ProviderRegistry::boot(&config.oidc, provider_rows, redirect_uri).await?);
     tracing::info!(
         issuer = config.oidc.issuer_url.as_deref().unwrap_or("<none>"),
-        "OIDC discovery complete"
+        providers = providers.enabled().len(),
+        "identity providers loaded"
     );
+    if providers.enabled().is_empty() {
+        tracing::warn!("no identity provider is enabled: /auth/login refuses until one is added");
+    }
 
     let (schedule_tx, schedule_rx) = tokio::sync::mpsc::unbounded_channel::<ScheduleRequest>();
     let custody_sink = CustodySink::new(writer_handle.clone(), schedule_tx);
 
     let upstream = Arc::new(OidcUpstream::new(
-        oidc.clone(),
+        providers.clone(),
         reader.clone(),
         writer_handle.clone(),
         clock.clone(),
@@ -295,7 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = session_broker::telemetry::http::instrument_router(
         http::router(state)
-            .layer(Extension(oidc))
+            .layer(Extension(providers.clone()))
             .layer(Extension(events.clone())),
         "public",
         metrics.clone(),
@@ -314,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics: metrics.clone(),
         rate_limit: admin_rate_limit,
         issuer: issuer.as_ref().map(|h| h.signer.clone()),
+        providers: providers.clone(),
     };
     if admin_state.admin_key.is_none() {
         tracing::warn!(

@@ -630,6 +630,17 @@ A signed-in user trades their session for a signed token. Public listener,
 - **INV-6a concurrent-IP anomaly** needs a per-generation `client_ip_prefix`.
 - **M9 as a CI Playwright spec** — browser-verified by hand, not automated.
 
+## Identity providers (ADR-0018, 2026-11-01)
+
+Providers are data: table `identity_provider` (schema v6), `ProviderRegistry`
+(`providers.rs`), admin routes in `http/admin/providers.rs`, `GET /auth/providers`
+and `/auth/login?provider=`. The config-file provider is the read-only id `default`,
+and the broker boots with none. A person from a store provider is
+`<provider_id>|<upstream sub>`. Proved against `mock-idp` as two providers
+(`providers/tests.rs`, `tests/providers_boot.rs`, the second driving the real binary).
+Not run against a real tenant. Keys read at discovery are not refreshed, and client
+authentication is `client_secret_post` only (see the ADR's known limits).
+
 ## Not built, deliberately
 
 - Subdomain/CORS topology (v1 is single-origin path-mounted, INV-10).

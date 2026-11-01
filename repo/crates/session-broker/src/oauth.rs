@@ -37,6 +37,7 @@ use openidconnect::{
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope,
     TokenResponse as OidcTokenResponse,
 };
+use std::sync::Arc;
 
 use crate::clock::Timestamp;
 use crate::config::OidcConfig;
@@ -46,6 +47,20 @@ use crate::config::OidcConfig;
 /// (`http/auth.rs`) is built to match this exactly, so the two must move
 /// together if this ever becomes configurable.
 pub(crate) const TXN_TTL_SECS: u64 = 600;
+
+/// The provider built from the config file. Its people keep the upstream
+/// spelling of `sub`, so a deployment that adds a second provider changes nobody.
+pub const DEFAULT_PROVIDER: &str = "default";
+
+/// The broker's name for a person: two issuers can both produce sub "123", and
+/// they are two people (ADR-0018). The one place the spelling is decided.
+pub fn person_subject(provider_id: &str, upstream_sub: &str) -> String {
+    if provider_id == DEFAULT_PROVIDER {
+        upstream_sub.to_owned()
+    } else {
+        format!("{provider_id}|{upstream_sub}")
+    }
+}
 
 /// The concrete type `CoreClient::from_provider_metadata(..).set_redirect_uri(..)`
 /// produces: an authorization endpoint and a (per discovery, possibly-unset
@@ -93,6 +108,19 @@ pub enum OauthError {
     /// the one error variant for all of them.
     #[error("id_token failed verification: {0}")]
     InvalidIdToken(String),
+    /// RFC 9207: the callback named a different issuer than the provider this
+    /// login was started on. A mix-up attack looks exactly like this.
+    #[error("the iss parameter does not match the provider this login started on")]
+    IssuerMismatch,
+    #[error("the provider this login started on has been disabled")]
+    ProviderDisabled,
+    #[error("the provider this login started on no longer exists")]
+    ProviderGone,
+    #[error("the provider this login started on cannot be reached: {0}")]
+    ProviderUnavailable(String),
+    /// A config-provider subject spelled like another provider's person.
+    #[error("the subject collides with another provider's namespace")]
+    SubjectCollision,
 }
 
 impl OauthError {
@@ -114,6 +142,11 @@ impl OauthError {
             OauthError::Exchange(_) => "exchange_failed",
             OauthError::MissingIdToken => "missing_id_token",
             OauthError::InvalidIdToken(_) => "invalid_id_token",
+            OauthError::IssuerMismatch => "iss_mismatch",
+            OauthError::ProviderDisabled => "provider_disabled",
+            OauthError::ProviderGone => "provider_gone",
+            OauthError::ProviderUnavailable(_) => "provider_unavailable",
+            OauthError::SubjectCollision => "subject_collision",
         }
     }
 }
@@ -128,7 +161,10 @@ pub struct UpstreamTokens {
     pub refresh_token: Option<String>,
     pub expires_at: Timestamp,
     pub scope: Option<String>,
+    /// The broker's name for the person, per [`person_subject`].
     pub sub: String,
+    /// The provider that issued this grant.
+    pub provider_id: String,
 }
 
 impl std::fmt::Debug for UpstreamTokens {
@@ -142,6 +178,7 @@ impl std::fmt::Debug for UpstreamTokens {
             .field("expires_at", &self.expires_at)
             .field("scope", &self.scope)
             .field("sub", &self.sub)
+            .field("provider_id", &self.provider_id)
             .finish()
     }
 }
@@ -150,6 +187,9 @@ impl std::fmt::Debug for UpstreamTokens {
 /// `nonce`, and `return_to`, keyed by a random id the browser only ever
 /// sees the opaque form of via [`Txn::cookie_value`].
 struct TxnRecord {
+    /// Which provider this login belongs to: the callback completes there, on
+    /// no evidence from the browser beyond the opaque id.
+    provider_id: String,
     state: String,
     nonce: String,
     pkce_verifier: String,
@@ -174,8 +214,11 @@ impl Txn {
 
 /// In-memory, single-use, TTL-bounded transaction store. See the module
 /// docs for why this is memory-only rather than the durable `txn` table.
+///
+/// Shared by every provider's client, so replacing a client does not strand a
+/// login already in flight.
 #[derive(Default)]
-struct TxnStore {
+pub struct TxnStore {
     txns: DashMap<String, TxnRecord>,
 }
 
@@ -192,6 +235,17 @@ impl TxnStore {
     fn take(&self, id: &str) -> Option<TxnRecord> {
         self.txns.remove(id).map(|(_, record)| record)
     }
+
+    /// Which provider a presented txn belongs to. Reads only: redeeming it
+    /// stays the job of [`OidcClient::complete_login`].
+    pub(crate) fn provider_of(&self, id: &str) -> Option<String> {
+        self.txns.get(id).map(|r| r.provider_id.clone())
+    }
+
+    /// See [`OidcClient::discard_txn`].
+    pub(crate) fn discard(&self, id: &str) {
+        self.take(id);
+    }
 }
 
 /// A discovered, ready-to-use OIDC relying-party client, built once at
@@ -203,7 +257,9 @@ pub struct OidcClient {
     core: DiscoveredClient,
     http_client: reqwest::Client,
     scopes: Vec<Scope>,
-    txns: TxnStore,
+    txns: Arc<TxnStore>,
+    provider_id: String,
+    issuer: String,
 }
 
 impl OidcClient {
@@ -238,19 +294,39 @@ impl OidcClient {
             client_secret,
             redirect_uri,
             &config.scopes,
+            DEFAULT_PROVIDER,
+            Arc::default(),
         )
         .await
+    }
+
+    /// The provider this client belongs to.
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    /// The issuer as configured and as discovery confirmed it.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// The transaction store this client writes to.
+    #[cfg(test)]
+    pub(crate) fn txn_store(&self) -> Arc<TxnStore> {
+        self.txns.clone()
     }
 
     /// The shared construction path behind both [`OidcClient::discover`] and
     /// the crate-internal test helper below: everything from URL parsing
     /// onward is identical regardless of where the strings came from.
-    async fn build(
+    pub(crate) async fn build(
         issuer: &str,
         client_id: &str,
         client_secret: &str,
         redirect_uri: &str,
         scopes: &[String],
+        provider_id: &str,
+        txns: Arc<TxnStore>,
     ) -> Result<OidcClient, OauthError> {
         let issuer_url =
             IssuerUrl::new(issuer.to_owned()).map_err(|e| OauthError::InvalidUrl(e.to_string()))?;
@@ -263,6 +339,9 @@ impl OidcClient {
         // (e.g. an internal address) must not be silently followed.
         let http_client = reqwest::ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
+            // With several providers, a hung IdP must not hold a keepalive batch
+            // that includes everyone else's grants.
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| OauthError::Discovery(e.to_string()))?;
 
@@ -295,7 +374,9 @@ impl OidcClient {
             core,
             http_client,
             scopes,
-            txns: TxnStore::default(),
+            txns,
+            provider_id: provider_id.to_owned(),
+            issuer: issuer.to_owned(),
         })
     }
 
@@ -311,7 +392,16 @@ impl OidcClient {
         scopes: &[&str],
     ) -> Result<OidcClient, OauthError> {
         let scopes: Vec<String> = scopes.iter().map(|s| (*s).to_owned()).collect();
-        Self::build(issuer, client_id, client_secret, redirect_uri, &scopes).await
+        Self::build(
+            issuer,
+            client_id,
+            client_secret,
+            redirect_uri,
+            &scopes,
+            DEFAULT_PROVIDER,
+            Arc::default(),
+        )
+        .await
     }
 
     /// Start a login: generate PKCE (S256), `state`, and `nonce`; store them
@@ -336,6 +426,7 @@ impl OidcClient {
         let (authorize_url, csrf_token, nonce) = request.url();
 
         let txn = self.txns.insert(TxnRecord {
+            provider_id: self.provider_id.clone(),
             state: csrf_token.secret().clone(),
             nonce: nonce.secret().clone(),
             pkce_verifier: pkce_verifier.secret().clone(),
@@ -370,6 +461,11 @@ impl OidcClient {
         // INV-3c: taken unconditionally, before any of the checks below, so
         // every subsequent failure still leaves the txn consumed.
         let record = self.txns.take(txn_id).ok_or(OauthError::UnknownTxn)?;
+        // The store is shared, so a txn of another provider is reachable from
+        // here. Its nonce and verifier mean nothing to this client.
+        if record.provider_id != self.provider_id {
+            return Err(OauthError::UnknownTxn);
+        }
 
         // INV-3d: TTL judged against the injected clock, never wall time —
         // deterministic under `TestClock::advance`, no sleeping required.
@@ -404,7 +500,7 @@ impl OidcClient {
             .claims(&verifier, &nonce)
             .map_err(|e| OauthError::InvalidIdToken(e.to_string()))?;
 
-        let sub = claims.subject().as_str().to_owned();
+        let sub = person_subject(&self.provider_id, claims.subject().as_str());
         let access_token = token_response.access_token().secret().to_owned();
         let refresh_token = token_response
             .refresh_token()
@@ -430,6 +526,7 @@ impl OidcClient {
                 expires_at,
                 scope,
                 sub,
+                provider_id: self.provider_id.clone(),
             },
             record.return_to,
         ))

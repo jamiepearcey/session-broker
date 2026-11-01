@@ -40,6 +40,7 @@ use crate::store::{repo, writer::WriterHandle, Reader};
 use crate::telemetry::{LogControl, Metrics};
 
 mod identity;
+mod providers;
 
 #[derive(Clone)]
 pub struct AdminState {
@@ -63,6 +64,8 @@ pub struct AdminState {
     /// The token issuer's signing keys. `None` when they could not be loaded
     /// at boot, and in tests that do not exercise them.
     pub issuer: Option<Arc<crate::issuer::Issuer>>,
+    /// The identity providers `/auth/login` answers from.
+    pub providers: Arc<crate::providers::ProviderRegistry>,
 }
 
 /// The admin actor for an audited row.
@@ -125,6 +128,18 @@ pub fn router(state: AdminState) -> Router {
             "/admin/user-grants/{sub}/{tenant}",
             delete(identity::revoke_user_grant),
         )
+        .route(
+            "/admin/providers",
+            get(providers::list).post(providers::create),
+        )
+        .route("/admin/providers/test", post(providers::test))
+        .route(
+            "/admin/providers/{id}",
+            get(providers::get_one)
+                .put(providers::update)
+                .delete(providers::remove),
+        )
+        .route("/admin/providers/{id}/people", get(providers::people))
         .route("/admin/audit", get(list_audit))
         .route(
             "/admin/observability",
@@ -1072,6 +1087,9 @@ mod tests {
                 lane: "admin",
             }),
             issuer: None,
+            providers: Arc::new(crate::providers::ProviderRegistry::empty(
+                "http://localhost:8080/auth/callback",
+            )),
         };
         (router(state), writer)
     }
@@ -1196,6 +1214,9 @@ mod tests {
             metrics,
             rate_limit: None,
             issuer: None,
+            providers: Arc::new(crate::providers::ProviderRegistry::empty(
+                "http://localhost:8080/auth/callback",
+            )),
         };
         (router(state), writer)
     }
@@ -1407,6 +1428,9 @@ mod tests {
             metrics,
             rate_limit: None,
             issuer: Some(issuer),
+            providers: Arc::new(crate::providers::ProviderRegistry::empty(
+                "http://localhost:8080/auth/callback",
+            )),
         };
         Lane {
             router: router(state),

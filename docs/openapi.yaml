@@ -116,6 +116,11 @@ paths:
             than silently downgraded: nothing has been created yet, so there is
             nothing to protect by continuing.
           schema: { type: string, example: /dashboard }
+        - name: provider
+          in: query
+          required: false
+          description: Which identity provider. Optional while exactly one is enabled.
+          schema: { type: string, example: entra }
       responses:
         "303":
           description: Redirect to the IdP's authorization endpoint.
@@ -125,10 +130,48 @@ paths:
               description: "`__Host-broker_txn`, `HttpOnly`, `Max-Age=600`."
               schema: { type: string }
         "400":
-          description: "`return_to` was not a same-origin absolute path."
+          description: "`bad_request` (`return_to` was not a same-origin absolute path) or `provider_required` (several are enabled and none was chosen)."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "403":
+          description: "`provider_disabled`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404":
+          description: "`unknown_provider`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: "`no_providers` (none is enabled) or `provider_unavailable` (its discovery failed just now)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /auth/providers:
+    get:
+      tags: [auth]
+      summary: The enabled identity providers, for a sign-in chooser.
+      security: []
+      responses:
+        "200":
+          description: Possibly none.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, display_name]
+                      properties:
+                        id: { type: string }
+                        display_name: { type: string }
 
   /auth/callback:
     get:
@@ -991,7 +1034,7 @@ paths:
               additionalProperties: false
               required: [sub, roles]
               properties:
-                sub: { type: string, minLength: 1, maxLength: 256, description: The identity provider subject. }
+                sub: { type: string, minLength: 1, maxLength: 320, description: "The person: the upstream subject for the `default` provider, otherwise `<provider_id>|<upstream sub>`." }
                 tenant: { allOf: [{ $ref: "#/components/schemas/Slug" }], default: default }
                 roles: { $ref: "#/components/schemas/Words" }
                 indexes: { allOf: [{ $ref: "#/components/schemas/Words" }], description: 'Default `["*"]`: every index of the tenant.' }
@@ -1030,6 +1073,247 @@ paths:
         "204": { description: Revoked. }
         "404":
           description: "`unknown_grant`. No live grant for that pair."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/providers:
+    get:
+      tags: [admin]
+      summary: List identity providers.
+      description: The config-file provider appears as `default`, read-only. No response carries a client secret.
+      security: [{ adminApiKey: [] }]
+      responses:
+        "200":
+          description: The providers, and the one redirect URI to register at each IdP.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [redirect_uri, providers]
+                properties:
+                  redirect_uri: { type: string }
+                  providers: { type: array, items: { $ref: "#/components/schemas/Provider" } }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+    post:
+      tags: [admin]
+      summary: Add an identity provider.
+      description: |
+        With `enabled` true (the default) discovery runs first, and a failure saves
+        nothing. Tier A (`provider.created`). A deleted id may return on the issuer
+        it had, and on no other.
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id, preset, display_name, issuer_url, client_id, client_secret]
+              properties:
+                id: { $ref: "#/components/schemas/Slug" }
+                preset: { $ref: "#/components/schemas/ProviderPreset" }
+                display_name: { type: string, minLength: 1, maxLength: 128 }
+                issuer_url: { type: string, description: "https, or http on loopback. Must equal the issuer discovery returns, byte for byte." }
+                client_id: { type: string, minLength: 1, maxLength: 512 }
+                client_secret: { type: string, minLength: 1, maxLength: 4096, writeOnly: true }
+                scopes: { allOf: [{ $ref: "#/components/schemas/Words" }], description: 'Must include `openid`. Default `["openid","profile","email","offline_access"]`.' }
+                enabled: { type: boolean, default: true }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "400":
+          description: "`bad_request`, `invalid_id`, `invalid_preset`, `invalid_display_name`, `invalid_issuer` (with `failure`), `invalid_client_id`, `invalid_secret` or `invalid_scopes`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderRefusal" }
+        "409":
+          description: "`reserved_id`, `provider_exists` or `provider_id_retired`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "422":
+          description: "`discovery_failed`, with `failure`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderRefusal" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/providers/test:
+    post:
+      tags: [admin]
+      summary: Run discovery against an unsaved issuer.
+      description: No client id or secret is involved, and nothing is saved. A failed probe is still a 200.
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [issuer_url]
+              properties:
+                issuer_url: { type: string }
+      responses:
+        "200":
+          description: "`ok: true` with the endpoints found, or `ok: false` with the named `failure`."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, issuer_url]
+                properties:
+                  ok: { type: boolean }
+                  issuer_url: { type: string }
+                  issuer: { type: string }
+                  authorization_endpoint: { type: string }
+                  token_endpoint: { type: string }
+                  jwks_uri: { type: string }
+                  userinfo_endpoint: { type: [string, "null"] }
+                  end_session_endpoint: { type: [string, "null"] }
+                  jwks_keys: { type: integer }
+                  failure: { $ref: "#/components/schemas/DiscoveryFailure" }
+                  detail: { type: string }
+        "400":
+          description: "`bad_request`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/providers/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: "#/components/schemas/Slug" } }
+    get:
+      tags: [admin]
+      summary: One identity provider.
+      security: [{ adminApiKey: [] }]
+      responses:
+        "200":
+          description: The provider.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "404":
+          description: "`unknown_provider`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+    put:
+      tags: [admin]
+      summary: Change an identity provider.
+      description: |
+        A merge: an absent field stays as it is, including the secret. Discovery runs
+        when the result is enabled and either it was disabled or a connection field
+        changed. Tier A (`provider.updated`).
+      security: [{ adminApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                preset: { $ref: "#/components/schemas/ProviderPreset" }
+                display_name: { type: string, minLength: 1, maxLength: 128 }
+                issuer_url: { type: string }
+                client_id: { type: string, minLength: 1, maxLength: 512 }
+                client_secret: { type: string, minLength: 1, maxLength: 4096, writeOnly: true, description: Absent keeps the stored one. Empty is refused. }
+                scopes: { $ref: "#/components/schemas/Words" }
+                enabled: { type: boolean }
+      responses:
+        "200":
+          description: Changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "400":
+          description: As for POST.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderRefusal" }
+        "404":
+          description: "`unknown_provider`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "409":
+          description: "`read_only_provider`, or `issuer_locked` (the issuer cannot change once people or grants exist under the id)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "422":
+          description: "`discovery_failed`, with `failure`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderRefusal" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+    delete:
+      tags: [admin]
+      summary: Delete an identity provider.
+      description: |
+        Destroys the secret and leaves a tombstone holding the id. Grants it issued
+        fail at their next refresh, and the upstream-revoked policy applies. Tier A
+        (`provider.deleted`).
+      security: [{ adminApiKey: [] }]
+      responses:
+        "204": { description: Deleted. }
+        "404":
+          description: "`unknown_provider`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "409":
+          description: "`read_only_provider`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LaneError" }
+        "401": { $ref: "#/components/responses/AdminUnauthorised" }
+        "501": { $ref: "#/components/responses/AdminDisabled" }
+
+  /admin/providers/{id}/people:
+    get:
+      tags: [admin]
+      summary: People with an upstream grant still held under a provider.
+      description: Newest first, at most 256. `sub` is the spelling a user grant takes.
+      security: [{ adminApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { $ref: "#/components/schemas/Slug" } }
+      responses:
+        "200":
+          description: The people.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provider_id, people]
+                properties:
+                  provider_id: { type: string }
+                  people:
+                    type: array
+                    items:
+                      type: object
+                      required: [sub, last_seen, custodies]
+                      properties:
+                        sub: { type: string }
+                        last_seen: { type: integer, description: Epoch seconds. }
+                        custodies: { type: integer }
+        "404":
+          description: "`unknown_provider`."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/LaneError" }
@@ -1505,6 +1789,41 @@ components:
         login_url:
           type: [string, "null"]
           description: Where to send the browser to re-authenticate, so the SDK never builds one itself.
+
+    ProviderPreset:
+      type: string
+      description: A label only; the console derives the issuer from it. The config-file provider reads `config`.
+      enum: [entra, okta, auth0, google, keycloak, generic]
+
+    DiscoveryFailure:
+      type: string
+      enum: [invalid_url, issuer_not_https, unreachable, http_status, not_json, missing_endpoint, issuer_mismatch, insecure_endpoint, jwks_unreachable, jwks_invalid, secret_unavailable, client_build_failed]
+
+    ProviderRefusal:
+      type: object
+      required: [error, detail]
+      properties:
+        error: { type: string }
+        failure: { $ref: "#/components/schemas/DiscoveryFailure" }
+        detail: { type: string }
+
+    Provider:
+      type: object
+      description: There is no field for the client secret.
+      required: [id, preset, display_name, issuer_url, client_id, scopes, enabled, read_only, has_secret, redirect_uri, created_at, updated_at]
+      properties:
+        id: { type: string }
+        preset: { type: string }
+        display_name: { type: string }
+        issuer_url: { type: string }
+        client_id: { type: string }
+        scopes: { type: array, items: { type: string } }
+        enabled: { type: boolean }
+        read_only: { type: boolean, description: The config-file provider. }
+        has_secret: { type: boolean, description: False if the stored secret could not be opened. }
+        redirect_uri: { type: string, description: Register this at the IdP. }
+        created_at: { type: [integer, "null"] }
+        updated_at: { type: [integer, "null"] }
 
     LaneError:
       type: object

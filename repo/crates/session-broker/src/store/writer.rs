@@ -170,6 +170,18 @@ pub enum AdminWrite {
         tenant_id: String,
         now: Timestamp,
     },
+    InsertProvider {
+        provider: repo::NewProvider,
+        now: Timestamp,
+    },
+    UpdateProvider {
+        provider: repo::ProviderUpdate,
+        now: Timestamp,
+    },
+    DeleteProvider {
+        id: String,
+        now: Timestamp,
+    },
 }
 
 impl AdminWrite {
@@ -179,7 +191,8 @@ impl AdminWrite {
         match self {
             AdminWrite::InsertTenant { .. }
             | AdminWrite::InsertPrincipal { .. }
-            | AdminWrite::InsertUserGrant { .. } => "conflict",
+            | AdminWrite::InsertUserGrant { .. }
+            | AdminWrite::InsertProvider { .. } => "conflict",
             _ => "not_found",
         }
     }
@@ -697,6 +710,15 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                             tenant_id,
                             now,
                         } => repo::revoke_user_grant(&tx, &sub, &tenant_id, now),
+                        AdminWrite::InsertProvider { provider, now } => {
+                            repo::insert_provider(&tx, &provider, now)
+                        }
+                        AdminWrite::UpdateProvider { provider, now } => {
+                            repo::update_provider(&tx, &provider, now)
+                        }
+                        AdminWrite::DeleteProvider { id, now } => {
+                            repo::delete_provider(&tx, &id, now)
+                        }
                     }?;
 
                     // Tier A: same transaction as the mutation, so there is no
@@ -717,9 +739,11 @@ fn apply_batch(conn: &Connection, batch: Vec<Command>) -> BatchOutcome {
                 }
                 Command::Reseal => {
                     let all = repo::reseal_all(&tx)?;
-                    for (what, report) in
-                        [("custody", all.custody), ("signing_key", all.signing_keys)]
-                    {
+                    for (what, report) in [
+                        ("custody", all.custody),
+                        ("signing_key", all.signing_keys),
+                        ("identity_provider", all.identity_providers),
+                    ] {
                         if report.resealed > 0 || report.failed > 0 {
                             tracing::info!(
                                 target: "broker::keys",
@@ -771,6 +795,7 @@ mod tests {
             next_refresh: now.plus_secs(1800),
             fail_count: 0,
             updated_at: now,
+            provider_id: "default".to_owned(),
         }
     }
 
@@ -971,6 +996,7 @@ mod reaper_tests {
                 next_refresh: T0.plus_secs(1800),
                 fail_count: 0,
                 updated_at: T0,
+                provider_id: "default".to_owned(),
             },
         )
         .unwrap();

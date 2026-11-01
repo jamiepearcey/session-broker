@@ -126,6 +126,9 @@ fn harness_with(
         metrics: metrics.clone(),
         rate_limit: None,
         issuer: signer,
+        providers: Arc::new(crate::providers::ProviderRegistry::empty(
+            "http://localhost:8080/auth/callback",
+        )),
     });
     Harness {
         app: hardening::apply(crate::http::router(state), hardening::Hardening::default()),

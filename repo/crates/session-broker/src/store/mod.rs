@@ -24,7 +24,7 @@ pub mod writer;
 
 /// Schema version this binary knows how to reach. Bump this and append to
 /// [`MIGRATIONS`] together — the two must stay the same length.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Forward-only migration steps, applied in order inside one transaction at
 /// boot. `store::migrate` tracks how far a given database file has already
@@ -206,6 +206,28 @@ const MIGRATIONS: &[&str] = &[
       retire_at   INTEGER,                -- published until here; NULL = open
       removed_at  INTEGER                 -- set by the prune once past retire_at
     );
+    "#,
+    // v6 — identity providers as data (ADR-0018). Everything that existed before
+    // this came from the config-file provider, hence the column default. A
+    // deleted provider stays as a tombstone with its secret emptied: its id names
+    // a set of people, so the id cannot be handed to a different issuer.
+    r#"
+    CREATE TABLE identity_provider (
+      id                   TEXT PRIMARY KEY,   -- slug, the `<id>|` in a person's sub
+      preset               TEXT NOT NULL,
+      display_name         TEXT NOT NULL,
+      issuer_url           TEXT NOT NULL,
+      client_id            TEXT NOT NULL,
+      client_secret_sealed BLOB NOT NULL,      -- sealed, context `provider:<id>:client_secret`
+      scopes               TEXT NOT NULL,      -- JSON array
+      enabled              INTEGER NOT NULL,
+      created_at           INTEGER NOT NULL,
+      updated_at           INTEGER NOT NULL,
+      deleted_at           INTEGER
+    );
+    ALTER TABLE custody ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'default';
+    ALTER TABLE session ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'default';
+    CREATE INDEX custody_provider ON custody(provider_id, sub);
     "#,
 ];
 
@@ -396,6 +418,7 @@ mod tests {
             "principal_secret",
             "user_grant",
             "signing_key",
+            "identity_provider",
             "schema_version",
         ] {
             let count: i64 = conn

@@ -244,7 +244,7 @@ impl FromRef<AppState> for Arc<HttpConfig> {
 /// The session lane, plus `/auth/*` (M2). `/proxy/*` (M5) mounts alongside
 /// later.
 ///
-/// The two `/auth/*` handlers need an `Arc<OidcClient>` that this function's
+/// The `/auth/*` handlers need an `Arc<ProviderRegistry>` that this function's
 /// signature has no room for (it is called throughout the existing test
 /// suite with only an `AppState`) — so it is supplied as a request
 /// extension, layered on by whoever finishes building the app (see
@@ -260,6 +260,7 @@ pub fn router(state: AppState) -> Router {
             post(session::post_refresh).get(session::get_refresh),
         )
         .route("/logout", post(session::post_logout))
+        .route("/auth/providers", get(auth::providers))
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/token", post(token::issue))

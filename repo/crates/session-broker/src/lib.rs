@@ -21,6 +21,7 @@ pub mod http;
 pub mod issuer;
 pub mod keepalive;
 pub mod oauth;
+pub mod providers;
 pub mod ratelimit;
 pub mod session;
 pub mod store;

@@ -35,6 +35,16 @@ pub enum ErrorCode {
     LaneDisabled,
     /// The broker could not read its own store or sign.
     Unavailable,
+    /// `/auth/login`: no identity provider is enabled.
+    NoProviders,
+    /// `/auth/login`: several are enabled and the request did not choose.
+    ProviderRequired,
+    /// `/auth/login?provider=`: no such provider.
+    UnknownProvider,
+    /// `/auth/login?provider=`: that provider is disabled.
+    ProviderDisabled,
+    /// `/auth/login`: the provider's discovery failed just now. Retryable.
+    ProviderUnavailable,
 }
 
 impl ErrorCode {
@@ -44,13 +54,19 @@ impl ErrorCode {
             | ErrorCode::SessionStale
             | ErrorCode::SessionExpired
             | ErrorCode::LoginRequired => StatusCode::UNAUTHORIZED,
-            ErrorCode::CsrfRejected | ErrorCode::NotGranted => StatusCode::FORBIDDEN,
-            ErrorCode::UpstreamRevoked => StatusCode::CONFLICT,
-            ErrorCode::OauthError | ErrorCode::BadRequest | ErrorCode::BadAudience => {
-                StatusCode::BAD_REQUEST
+            ErrorCode::CsrfRejected | ErrorCode::NotGranted | ErrorCode::ProviderDisabled => {
+                StatusCode::FORBIDDEN
             }
+            ErrorCode::UpstreamRevoked => StatusCode::CONFLICT,
+            ErrorCode::OauthError
+            | ErrorCode::BadRequest
+            | ErrorCode::BadAudience
+            | ErrorCode::ProviderRequired => StatusCode::BAD_REQUEST,
+            ErrorCode::UnknownProvider => StatusCode::NOT_FOUND,
             ErrorCode::LaneDisabled => StatusCode::NOT_IMPLEMENTED,
-            ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable | ErrorCode::NoProviders | ErrorCode::ProviderUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         }
     }
