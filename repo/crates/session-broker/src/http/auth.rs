@@ -161,6 +161,7 @@ pub struct CallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+    error_description: Option<String>,
     /// RFC 9207. Not every provider sends it; when one does it must match.
     iss: Option<String>,
 }
@@ -187,14 +188,14 @@ pub async fn callback(
         // page, no session.
         None => {
             record_login_failure(&state, "no_txn_cookie", now);
-            error_redirect(&state.config)
+            error_redirect(&state.config, "no_txn_cookie", "The browser sent no sign-in cookie with this response.")
         }
         Some(id) => match resolve(&registry, id, &query, now).await {
             Ok((tokens, return_to)) => success_response(&state, tokens, return_to, now),
             Err(error) => {
                 tracing::warn!(%error, "oauth callback failed");
                 record_login_failure(&state, error.code(), now);
-                error_redirect(&state.config)
+                error_redirect(&state.config, error.code(), &error.to_string())
             }
         },
     };
@@ -233,7 +234,11 @@ async fn resolve(
     }
     if let Some(error) = &query.error {
         oidc.discard_txn(txn_id);
-        return Err(OauthError::ProviderError(error.clone()));
+        let said = match &query.error_description {
+            Some(description) => format!("{error}: {description}"),
+            None => error.clone(),
+        };
+        return Err(OauthError::ProviderError(said));
     }
     let (Some(code), Some(state_param)) = (query.code.as_deref(), query.state.as_deref()) else {
         oidc.discard_txn(txn_id);
@@ -346,8 +351,104 @@ fn record_login_failure(state: &AppState, reason: &'static str, now: crate::cloc
 /// must not gain one for this milestone (see this module's wiring note and
 /// `http/mod.rs`'s docs), so `/error` — the same default
 /// `BrokerConfig::error_page_path` already uses — is hardcoded here too.
-fn error_redirect(config: &HttpConfig) -> Response {
-    redirect(&format!("{}/error?error=oauth_error", config.origin()))
+fn error_redirect(config: &HttpConfig, code: &str, detail: &str) -> Response {
+    let reference = random_id();
+    let mut held = failures().lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() >= FAILURES_HELD {
+        held.pop_front();
+    }
+    held.push_back(Failure {
+        reference: reference.clone(),
+        code: code.to_owned(),
+        detail: detail.chars().take(800).collect(),
+    });
+    drop(held);
+    redirect(&format!("{}/error?ref={reference}", config.origin()))
+}
+
+/// What a failed sign-in said, for the page it lands on. The page reads it by an
+/// unguessable reference and never from the query, so a crafted link cannot put
+/// words on this origin.
+struct Failure {
+    reference: String,
+    code: String,
+    detail: String,
+}
+
+const FAILURES_HELD: usize = 64;
+
+fn failures() -> &'static std::sync::Mutex<std::collections::VecDeque<Failure>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<Failure>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// What to do about a failure, by the provider's own code where it has a known fix.
+fn failure_hint(code: &str, detail: &str) -> &'static str {
+    const BY_DETAIL: &[(&str, &str)] = &[
+        ("AADSTS7000215", "Entra rejected the client secret. Save the secret's Value, not its Secret ID, in Admin > Authentication."),
+        ("AADSTS7000222", "The client secret has expired. Create a new one in Entra and save its Value in Admin > Authentication."),
+        ("AADSTS700025", "Entra treats this app as a public client. Register the redirect URI under the Web platform, remove it from Mobile and desktop or Single-page application, and set Allow public client flows to No."),
+        ("AADSTS50011", "The redirect URI is not registered on the app. Copy it from Admin > Authentication into the provider exactly."),
+        ("AADSTS65001", "The app needs consent. Ask a tenant administrator to grant it."),
+        ("AADSTS700016", "The client ID was not found in this tenant. Check the client ID and tenant ID."),
+        ("access_denied", "Access was declined at the provider. Sign in again and accept, or ask an administrator for access."),
+        ("invalid_client", "The provider rejected the client credentials. Check the client ID and secret in Admin > Authentication."),
+        ("redirect_uri", "The redirect URI does not match. Copy it from Admin > Authentication into the provider exactly."),
+    ];
+    if let Some((_, hint)) = BY_DETAIL.iter().find(|(needle, _)| detail.contains(needle)) {
+        return hint;
+    }
+    match code {
+        "no_txn_cookie" | "unknown_txn" => "This sign-in attempt was not found. Start again from the sign-in link, in one browser and on one host name (localhost and 127.0.0.1 hold separate cookies).",
+        "txn_expired" => "This sign-in attempt took too long. Start again.",
+        "state_mismatch" | "iss_mismatch" => "This response does not belong to the sign-in that was started. Start again; if it repeats, tell an administrator.",
+        "invalid_id_token" => "The provider's identity token failed verification. Check the issuer and client ID, and the machine's clock.",
+        "provider_disabled" | "provider_gone" => "This provider is no longer available. Ask an administrator.",
+        _ => "Start again; if it repeats, give an administrator this message.",
+    }
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ErrorPageQuery {
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+}
+
+/// `GET /error?ref=`: where a failed sign-in lands. A browser gets a page and a caller
+/// asking for `application/json` gets `{error, detail, hint}`; both are status 400.
+pub async fn error_page(Query(query): Query<ErrorPageQuery>, headers: HeaderMap) -> Response {
+    let found = query.reference.as_deref().and_then(|reference| {
+        let held = failures().lock().unwrap_or_else(|e| e.into_inner());
+        held.iter().find(|f| f.reference == reference).map(|f| (f.code.clone(), f.detail.clone()))
+    });
+    let (code, detail) = found.unwrap_or_else(|| {
+        ("unknown_failure".to_owned(), "No details are held for this sign-in: the link is old, or the broker has restarted.".to_owned())
+    });
+    let hint = failure_hint(&code, &detail);
+    let wants_json = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains("application/json"));
+    if wants_json {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": code, "detail": detail, "hint": hint }))).into_response();
+    }
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Sign-in failed</title>\
+         <body style=\"font:15px system-ui;max-width:42rem;margin:4rem auto;padding:0 1rem\">\
+         <h1 style=\"font-size:1.4rem\">Sign-in failed</h1><p>{}</p>\
+         <p style=\"opacity:.75\">The provider said:</p>\
+         <pre style=\"white-space:pre-wrap;word-break:break-word\">{}</pre>\
+         <p style=\"opacity:.75\">Code: <code>{}</code></p></body></html>",
+        escape_html(hint),
+        escape_html(&detail),
+        escape_html(&code),
+    );
+    (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
 }
 
 fn redirect(location: &str) -> Response {
@@ -758,5 +859,50 @@ mod tests {
         let dev = HttpConfig::new("http://localhost:5173", &policy).unwrap();
         assert_eq!(txn_cookie_name(&dev), "broker_txn");
         assert!(!txn_cookie(&dev, "x", 600).contains("Secure"));
+    }
+
+    fn held_failure(code: &str, detail: &str) -> String {
+        let reference = random_id();
+        failures().lock().unwrap().push_back(Failure { reference: reference.clone(), code: code.to_owned(), detail: detail.to_owned() });
+        reference
+    }
+
+    async fn page(reference: Option<String>, accept: Option<&str>) -> (StatusCode, String) {
+        let mut headers = HeaderMap::new();
+        if let Some(accept) = accept {
+            headers.insert(header::ACCEPT, accept.parse().unwrap());
+        }
+        let response = error_page(Query(ErrorPageQuery { reference }), headers).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16384).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_failed_sign_in_page_says_the_provider_message_and_the_fix() {
+        let reference = held_failure("exchange_failed", "invalid_client: AADSTS700025: <b>public</b>");
+        let (status, body) = page(Some(reference), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("AADSTS700025"));
+        assert!(body.contains("Allow public client flows"));
+        assert!(body.contains("&lt;b&gt;public"));
+        assert!(!body.contains("<b>public"));
+    }
+
+    #[tokio::test]
+    async fn a_json_caller_gets_code_detail_and_hint() {
+        let reference = held_failure("exchange_failed", "AADSTS7000215: invalid secret");
+        let (status, body) = page(Some(reference), Some("application/json")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["error"], "exchange_failed");
+        assert!(json["hint"].as_str().unwrap().contains("Value"));
+    }
+
+    #[tokio::test]
+    async fn a_crafted_link_cannot_put_words_on_the_page() {
+        let (_, body) = page(Some("<script>attacker text".to_owned()), None).await;
+        assert!(body.contains("unknown_failure"));
+        assert!(!body.contains("attacker"));
     }
 }

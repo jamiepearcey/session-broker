@@ -302,7 +302,14 @@ impl Connection {
 /// it, and when it does not say, which RFC 8414 §2 defines as the same thing.
 /// Otherwise `client_secret_post`. Okta web apps default to basic, and `mock-idp`
 /// and some others advertise only post.
-fn choose_auth_type(supported: Option<&[CoreClientAuthMethod]>) -> AuthType {
+///
+/// Microsoft Entra is the exception: it advertises both, and a secret sent by
+/// Basic failed with AADSTS7000215 on a real tenant (2026-11-01, encoding of its
+/// `~` secrets not ruled out), while Microsoft documents the request body.
+fn choose_auth_type(issuer: &str, supported: Option<&[CoreClientAuthMethod]>) -> AuthType {
+    if issuer.starts_with("https://login.microsoftonline.com/") {
+        return AuthType::RequestBody;
+    }
     match supported {
         Some(methods) if !methods.contains(&CoreClientAuthMethod::ClientSecretBasic) => {
             AuthType::RequestBody
@@ -431,6 +438,7 @@ impl OidcClient {
             .map_err(|e| OauthError::Discovery(e.to_string()))?;
 
         let auth_type = choose_auth_type(
+            metadata.issuer().as_str(),
             metadata
                 .token_endpoint_auth_methods_supported()
                 .map(Vec::as_slice),
@@ -748,14 +756,18 @@ mod auth_type_tests {
 
     #[test]
     fn basic_when_supported_or_unsaid_and_post_otherwise() {
-        assert!(is_basic(choose_auth_type(None)), "RFC 8414 default");
-        assert!(is_basic(choose_auth_type(Some(&[ClientSecretBasic]))));
-        assert!(is_basic(choose_auth_type(Some(&[
+        assert!(is_basic(choose_auth_type("https://idp.example", None)), "RFC 8414 default");
+        assert!(is_basic(choose_auth_type("https://idp.example", Some(&[ClientSecretBasic]))));
+        assert!(is_basic(choose_auth_type("https://idp.example", Some(&[
             ClientSecretPost,
             ClientSecretBasic
         ]))));
-        assert!(!is_basic(choose_auth_type(Some(&[ClientSecretPost]))));
-        assert!(!is_basic(choose_auth_type(Some(&[]))));
+        assert!(!is_basic(choose_auth_type("https://idp.example", Some(&[ClientSecretPost]))));
+        assert!(!is_basic(choose_auth_type("https://idp.example", Some(&[]))));
+        assert!(!is_basic(choose_auth_type(
+            "https://login.microsoftonline.com/tenant/v2.0",
+            Some(&[ClientSecretBasic, ClientSecretPost])
+        )));
     }
 }
 

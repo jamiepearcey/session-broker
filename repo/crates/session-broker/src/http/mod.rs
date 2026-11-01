@@ -261,6 +261,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/logout", post(session::post_logout))
         .route("/auth/providers", get(auth::providers))
+        .route("/error", get(auth::error_page))
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/token", post(token::issue))
