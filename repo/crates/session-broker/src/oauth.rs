@@ -30,14 +30,17 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use dashmap::DashMap;
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
-use openidconnect::{
-    AuthType, AuthorizationCode, ClientId, ClientSecret as OidcClientSecret, CsrfToken,
-    EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope,
-    TokenResponse as OidcTokenResponse,
+use openidconnect::core::{
+    CoreAuthenticationFlow, CoreClient, CoreClientAuthMethod, CoreJsonWebKeySet,
+    CoreProviderMetadata,
 };
-use std::sync::Arc;
+use openidconnect::{
+    AuthType, AuthorizationCode, ClaimsVerificationError, ClientId,
+    ClientSecret as OidcClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet, EndpointSet,
+    IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
+    RefreshToken, Scope, SignatureVerificationError, TokenResponse as OidcTokenResponse,
+};
+use std::sync::{Arc, RwLock};
 
 use crate::clock::Timestamp;
 use crate::config::OidcConfig;
@@ -47,6 +50,11 @@ use crate::config::OidcConfig;
 /// (`http/auth.rs`) is built to match this exactly, so the two must move
 /// together if this ever becomes configurable.
 pub(crate) const TXN_TTL_SECS: u64 = 600;
+
+/// How often an `id_token` naming a key this client does not hold may send it
+/// back to `jwks_uri`, per provider. The `kid` is the caller's to choose, so
+/// without a floor a forged token would drive a fetch per login attempt.
+pub(crate) const JWKS_REFETCH_MIN_INTERVAL_SECS: u64 = 300;
 
 /// The provider built from the config file. Its people keep the upstream
 /// spelling of `sub`, so a deployment that adds a second provider changes nobody.
@@ -254,7 +262,13 @@ impl TxnStore {
 /// map, which is internally synchronized, so `Arc<OidcClient>` is the shape
 /// the HTTP layer holds it in.
 pub struct OidcClient {
-    core: DiscoveredClient,
+    /// Swapped when the provider's keys are refetched, and never otherwise.
+    core: RwLock<Arc<DiscoveredClient>>,
+    /// What a key refetch needs to assemble the replacement for `core`.
+    connection: Connection,
+    /// When `jwks_uri` was last refetched. Held across the fetch, so a burst of
+    /// logins during a rotation makes one request, and then finds the new keys.
+    last_key_refetch: tokio::sync::Mutex<Option<Timestamp>>,
     http_client: reqwest::Client,
     scopes: Vec<Scope>,
     txns: Arc<TxnStore>,
@@ -262,7 +276,74 @@ pub struct OidcClient {
     issuer: String,
 }
 
+/// Everything a [`DiscoveredClient`] is assembled from.
+struct Connection {
+    metadata: CoreProviderMetadata,
+    client_id: ClientId,
+    client_secret: OidcClientSecret,
+    redirect_url: RedirectUrl,
+    auth_type: AuthType,
+}
+
+impl Connection {
+    fn assemble(&self, metadata: CoreProviderMetadata) -> DiscoveredClient {
+        CoreClient::from_provider_metadata(
+            metadata,
+            self.client_id.clone(),
+            Some(self.client_secret.clone()),
+        )
+        .set_redirect_uri(self.redirect_url.clone())
+        .set_auth_type(self.auth_type.clone())
+    }
+}
+
+/// How this broker authenticates at the token endpoint, for the code exchange
+/// and the refresh grant alike: `client_secret_basic` when the provider supports
+/// it, and when it does not say, which RFC 8414 §2 defines as the same thing.
+/// Otherwise `client_secret_post`. Okta web apps default to basic, and `mock-idp`
+/// and some others advertise only post.
+fn choose_auth_type(supported: Option<&[CoreClientAuthMethod]>) -> AuthType {
+    match supported {
+        Some(methods) if !methods.contains(&CoreClientAuthMethod::ClientSecretBasic) => {
+            AuthType::RequestBody
+        }
+        _ => AuthType::BasicAuth,
+    }
+}
+
 impl OidcClient {
+    fn core(&self) -> Arc<DiscoveredClient> {
+        self.core.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The `id_token` named a key this client does not hold, so the provider may
+    /// have rotated. Refetch `jwks_uri`, at most once per
+    /// [`JWKS_REFETCH_MIN_INTERVAL_SECS`], whether or not the attempt worked: a
+    /// failing IdP is no reason to let a forged `kid` drive more requests. A
+    /// failed or empty fetch keeps the keys already held.
+    async fn refetch_keys(&self, now: Timestamp) {
+        let mut last = self.last_key_refetch.lock().await;
+        if last.is_some_and(|at| now.since(at) < JWKS_REFETCH_MIN_INTERVAL_SECS) {
+            return;
+        }
+        *last = Some(now);
+
+        let metadata = &self.connection.metadata;
+        match CoreJsonWebKeySet::fetch_async(metadata.jwks_uri(), &self.http_client).await {
+            Ok(jwks) if !jwks.keys().is_empty() => {
+                let next = self.connection.assemble(metadata.clone().set_jwks(jwks));
+                *self.core.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+                tracing::info!(provider = %self.provider_id, "provider signing keys refetched");
+            }
+            Ok(_) => {
+                tracing::warn!(provider = %self.provider_id, "provider served an empty key set; keeping the keys held");
+            }
+            Err(error) => {
+                tracing::warn!(provider = %self.provider_id, %error, "refetching provider signing keys failed; keeping the keys held");
+            }
+        }
+    }
+
     /// Discover the provider (`{issuer}/.well-known/openid-configuration`
     /// plus its JWKS) and build a client ready to drive the authorization
     /// code flow. Fails if any of `issuer_url` / `client_id` /
@@ -349,17 +430,19 @@ impl OidcClient {
             .await
             .map_err(|e| OauthError::Discovery(e.to_string()))?;
 
-        let core = CoreClient::from_provider_metadata(
+        let auth_type = choose_auth_type(
+            metadata
+                .token_endpoint_auth_methods_supported()
+                .map(Vec::as_slice),
+        );
+        let connection = Connection {
             metadata,
-            ClientId::new(client_id.to_owned()),
-            Some(OidcClientSecret::new(client_secret.to_owned())),
-        )
-        .set_redirect_uri(redirect_url)
-        // `mock-idp` (and plenty of real providers) only advertise
-        // `client_secret_post` — the default is HTTP Basic auth, which
-        // would silently send no usable `client_id` in the token request
-        // body and fail with a generic `invalid_request`.
-        .set_auth_type(AuthType::RequestBody);
+            client_id: ClientId::new(client_id.to_owned()),
+            client_secret: OidcClientSecret::new(client_secret.to_owned()),
+            redirect_url,
+            auth_type,
+        };
+        let core = connection.assemble(connection.metadata.clone());
 
         // `openid` is added automatically by `from_provider_metadata`
         // (`use_openid_scope` defaults to true); drop it from the
@@ -371,7 +454,9 @@ impl OidcClient {
             .collect();
 
         Ok(OidcClient {
-            core,
+            core: RwLock::new(Arc::new(core)),
+            connection,
+            last_key_refetch: tokio::sync::Mutex::new(None),
             http_client,
             scopes,
             txns,
@@ -412,8 +497,8 @@ impl OidcClient {
     pub fn begin_login(&self, return_to: Option<String>, now: Timestamp) -> (String, Txn) {
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-        let mut request = self
-            .core
+        let core = self.core();
+        let mut request = core
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 CsrfToken::new_random,
@@ -477,8 +562,8 @@ impl OidcClient {
             return Err(OauthError::StateMismatch);
         }
 
-        let token_request = self
-            .core
+        let core = self.core();
+        let token_request = core
             .exchange_code(AuthorizationCode::new(code.to_owned()))
             .map_err(|e| OauthError::Exchange(e.to_string()))?
             .set_pkce_verifier(PkceCodeVerifier::new(record.pkce_verifier));
@@ -491,8 +576,20 @@ impl OidcClient {
         let id_token = token_response
             .id_token()
             .ok_or(OauthError::MissingIdToken)?;
-        let verifier = self.core.id_token_verifier();
         let nonce = Nonce::new(record.nonce);
+        // The code is spent by now, so the retry has to be of this token. The
+        // refetch is only reachable after issuer and audience have passed.
+        let key_unknown = matches!(
+            id_token.claims(&self.core().id_token_verifier(), &nonce),
+            Err(ClaimsVerificationError::SignatureVerification(
+                SignatureVerificationError::NoMatchingKey
+            ))
+        );
+        if key_unknown {
+            self.refetch_keys(now).await;
+        }
+        let current = self.core();
+        let verifier = current.id_token_verifier();
         // INV-3e (plus iss/aud/exp): `claims()` verifies the signature and
         // every one of those together, and refuses to hand back a claims
         // reference unless all of them hold.
@@ -549,8 +646,8 @@ impl OidcClient {
         refresh_token: &str,
         now: Timestamp,
     ) -> Result<RefreshedGrant, RefreshGrantError> {
-        let response = self
-            .core
+        let core = self.core();
+        let response = core
             .exchange_refresh_token(&RefreshToken::new(refresh_token.to_owned()))
             .map_err(|e| RefreshGrantError::Transient(e.to_string()))?
             .request_async(&self.http_client)
@@ -638,6 +735,28 @@ pub(crate) fn random_id() -> String {
     let mut bytes = [0u8; 32];
     crate::token::fill_random(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[cfg(test)]
+mod auth_type_tests {
+    use super::*;
+    use CoreClientAuthMethod::{ClientSecretBasic, ClientSecretPost};
+
+    fn is_basic(auth: AuthType) -> bool {
+        matches!(auth, AuthType::BasicAuth)
+    }
+
+    #[test]
+    fn basic_when_supported_or_unsaid_and_post_otherwise() {
+        assert!(is_basic(choose_auth_type(None)), "RFC 8414 default");
+        assert!(is_basic(choose_auth_type(Some(&[ClientSecretBasic]))));
+        assert!(is_basic(choose_auth_type(Some(&[
+            ClientSecretPost,
+            ClientSecretBasic
+        ]))));
+        assert!(!is_basic(choose_auth_type(Some(&[ClientSecretPost]))));
+        assert!(!is_basic(choose_auth_type(Some(&[]))));
+    }
 }
 
 #[cfg(test)]

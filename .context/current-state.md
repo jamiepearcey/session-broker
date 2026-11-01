@@ -638,8 +638,9 @@ and `/auth/login?provider=`. The config-file provider is the read-only id `defau
 and the broker boots with none. A person from a store provider is
 `<provider_id>|<upstream sub>`. Proved against `mock-idp` as two providers
 (`providers/tests.rs`, `tests/providers_boot.rs`, the second driving the real binary).
-Not run against a real tenant. Keys read at discovery are not refreshed, and client
-authentication is `client_secret_post` only (see the ADR's known limits).
+Client authentication follows discovery (basic when listed or unsaid, else post), and an
+unknown `kid` refetches `jwks_uri` at most once per five minutes per provider. Not run
+against a real tenant (see the ADR's known limits).
 
 ## Not built, deliberately
 

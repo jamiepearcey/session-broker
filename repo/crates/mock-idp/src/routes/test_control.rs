@@ -46,6 +46,24 @@ pub async fn revoke_refresh(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RotateKeysRequest {
+    pub publish: bool,
+}
+
+/// `POST /__test__/rotate-keys` — sign with a new key from now on. `publish:
+/// true` serves it at `/jwks.json` in place of the old one; `false` leaves the
+/// served set alone, so new tokens carry a `kid` nobody can find.
+pub async fn rotate_keys(
+    State(state): State<SharedState>,
+    Json(body): Json<RotateKeysRequest>,
+) -> impl IntoResponse {
+    match state.rotate_signing_key(body.publish) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FailNextRequest {
     #[serde(default = "default_fail_count")]
     pub count: u32,

@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
             post(test_control::revoke_refresh),
         )
         .route("/__test__/fail-next", post(test_control::fail_next))
+        .route("/__test__/rotate-keys", post(test_control::rotate_keys))
         .route("/__test__/state", get(test_control::dump_state))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

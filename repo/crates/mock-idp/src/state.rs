@@ -9,12 +9,13 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{config::MockIdpConfig, keys::SigningKey};
@@ -118,6 +119,7 @@ pub struct Counters {
     pub token_calls_by_grant: HashMap<String, u64>,
     pub userinfo_calls: u64,
     pub revoke_calls: u64,
+    pub jwks_calls: u64,
 }
 
 /// A queued instruction to make the next N `/token` calls fail, for
@@ -164,9 +166,17 @@ pub struct StateSnapshot {
     pub pending_fail_next: Option<u32>,
 }
 
+struct Keys {
+    signing: SigningKey,
+    /// What `/jwks.json` serves. A test can sign with a key that is not in here.
+    published: Value,
+    rotations: u32,
+}
+
 pub struct AppState {
     pub base_url: String,
-    pub signing_key: SigningKey,
+    keys: RwLock<Keys>,
+    pub token_auth_methods: Option<Vec<String>>,
     pub authorization_code_ttl_secs: u64,
     pub clients: HashMap<String, ClientRecord>,
     pub users: Vec<UserRecord>,
@@ -224,9 +234,15 @@ impl AppState {
             })
             .collect();
 
+        let signing = SigningKey::generate(config.rsa_seed)?;
         Ok(Self {
             base_url,
-            signing_key: SigningKey::generate(config.rsa_seed)?,
+            keys: RwLock::new(Keys {
+                published: signing.jwks_document(),
+                signing,
+                rotations: 0,
+            }),
+            token_auth_methods: config.token_auth_methods.clone(),
             authorization_code_ttl_secs: config.authorization_code_ttl_secs,
             clients,
             users,
@@ -244,6 +260,55 @@ impl AppState {
                 fail_next: None,
             }),
         })
+    }
+
+    /// Sign with the current key.
+    pub fn sign<T: Serialize>(&self, claims: &T) -> anyhow::Result<String> {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .signing
+            .sign(claims)
+    }
+
+    pub fn jwks_document(&self) -> Value {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .published
+            .clone()
+    }
+
+    /// Sign with a new key under a new id from now on. `publish` replaces the
+    /// served key set with it, which is a rotation; without it the signer's key
+    /// is one nobody can find, which is what a forged `kid` looks like.
+    pub fn rotate_signing_key(&self, publish: bool) -> anyhow::Result<()> {
+        let rotations = self
+            .keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .rotations
+            + 1;
+        let next = SigningKey::generate_with_kid(None, &format!("mock-idp-rsa-r{rotations}"))?;
+        let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
+        if publish {
+            keys.published = next.jwks_document();
+        }
+        keys.signing = next;
+        keys.rotations = rotations;
+        Ok(())
+    }
+
+    /// May a client with a secret authenticate at `/token` this way?
+    pub fn accepts_auth_method(&self, method: &str) -> bool {
+        match &self.token_auth_methods {
+            Some(methods) => methods.iter().any(|m| m == method),
+            None => method == "client_secret_basic",
+        }
+    }
+
+    pub fn record_jwks_call(&self) {
+        self.lock().counters.jwks_calls += 1;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

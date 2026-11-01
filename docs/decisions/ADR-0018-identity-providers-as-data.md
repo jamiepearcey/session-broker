@@ -51,6 +51,18 @@ refuses (ADR-0011). Deleting destroys the sealed secret and leaves a tombstone; 
 permanently at their next refresh and the same policy applies. A missing `default` is retried
 rather than treated as revoked, because a config change can be undone and a kill cannot.
 
+**Client authentication** at the token endpoint, code exchange and refresh alike, comes from
+discovery's `token_endpoint_auth_methods_supported`: `client_secret_basic` when listed, and when
+the field is absent, which RFC 8414 defines as the same thing; otherwise `client_secret_post`.
+This applies to `default` too, which until now always sent post, so a config provider that lists
+basic switches to it.
+
+**Key rotation.** An `id_token` naming a key the client does not hold sends it back to `jwks_uri`
+and verification is retried on the same token, since the code is already spent. The `kid` is the
+caller's to choose, so this happens at most once per five minutes per provider, whether or not
+the fetch worked, and is only reachable once issuer and audience have passed. A failed or empty
+fetch keeps the keys held. A token still unmatched afterwards is refused.
+
 ### Subject collision
 
 Two issuers can both say `sub: 123`, and those are two people. The broker's name for a person
@@ -87,10 +99,10 @@ what the brief asked for and each closing a way for grants to move to a stranger
 
 ## Known limits
 
-- **Keys are read at discovery and kept until the client is rebuilt.** That was already true of
-  the one client. An IdP that rotates keys, as Entra does, fails `invalid_id_token` until the
-  provider is edited or re-enabled, or the broker restarts.
-- **Client authentication is `client_secret_post` only.** That is the existing behaviour. A
-  client that an IdP holds to `client_secret_basic` will fail at the code exchange.
+- **A rotation inside the five-minute floor waits for it.** If a refetch already ran just before
+  an IdP publishes a new key, logins signed with that key fail `invalid_id_token` until the floor
+  passes, or the provider is edited or re-enabled, or the broker restarts.
+- **The method is chosen per provider, not per client.** An IdP that lists both methods but holds
+  this client to post will fail at the code exchange. `private_key_jwt` is not offered.
 - **Not run against a real Entra, Okta, Auth0, Google or Keycloak tenant.** The proof is
   `mock-idp` as two providers.

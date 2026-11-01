@@ -45,6 +45,11 @@ pub struct MockIdpConfig {
     /// across process restarts; a fixed seed makes them reproducible for
     /// golden-file style tests.
     pub rsa_seed: Option<u64>,
+    /// `token_endpoint_auth_methods_supported`, advertised AND enforced at
+    /// `/token` for a client with a secret. `None` omits the field from
+    /// discovery, and RFC 8414's default for that is `client_secret_basic`, so
+    /// that is what `/token` then accepts.
+    pub token_auth_methods: Option<Vec<String>>,
 }
 
 impl Default for MockIdpConfig {
@@ -66,6 +71,7 @@ impl Default for MockIdpConfig {
             rotate_refresh_tokens: false,
             authorization_code_ttl_secs: 60,
             rsa_seed: None,
+            token_auth_methods: Some(vec!["client_secret_post".to_owned(), "none".to_owned()]),
         }
     }
 }
@@ -151,6 +157,7 @@ impl From<Cli> for MockIdpConfig {
             rotate_refresh_tokens: cli.rotate_refresh_tokens,
             authorization_code_ttl_secs: cli.authorization_code_ttl_secs,
             rsa_seed: cli.rsa_seed,
+            ..MockIdpConfig::default()
         }
     }
 }

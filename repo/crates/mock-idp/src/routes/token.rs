@@ -3,10 +3,11 @@
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Form, Json,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 
@@ -37,7 +38,26 @@ pub struct TokenResponse {
     pub scope: String,
 }
 
-pub async fn token(State(state): State<SharedState>, Form(form): Form<TokenForm>) -> Response {
+/// `Authorization: Basic`, as `(client_id, client_secret)`. RFC 6749 §2.3.1 has
+/// both form-encoded first; this fixture's clients use no characters that change.
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let encoded = headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let (id, secret) = std::str::from_utf8(&decoded).ok()?.split_once(':')?;
+    Some((id.to_owned(), secret.to_owned()))
+}
+
+pub async fn token(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Form(form): Form<TokenForm>,
+) -> Response {
     let grant_type = form.grant_type.clone().unwrap_or_default();
     // Counted unconditionally, before latency/fail-next/validation: this is
     // the counter a broker's tests assert on to prove a code path did (or
@@ -56,14 +76,25 @@ pub async fn token(State(state): State<SharedState>, Form(form): Form<TokenForm>
             .into_response();
     }
 
-    let Some(client_id) = form.client_id.as_deref() else {
-        return OAuthError::invalid_request("client_id is required").into_response();
+    let basic = basic_credentials(&headers);
+    let (client_id, presented_secret, method) = match &basic {
+        Some((id, secret)) => (id.as_str(), Some(secret.as_str()), "client_secret_basic"),
+        None => {
+            let Some(id) = form.client_id.as_deref() else {
+                return OAuthError::invalid_request("client_id is required").into_response();
+            };
+            (id, form.client_secret.as_deref(), "client_secret_post")
+        }
     };
     let Some(client) = state.find_client(client_id) else {
         return OAuthError::invalid_client("unknown client_id").into_response();
     };
     if let Some(expected_secret) = client.client_secret.as_deref() {
-        if form.client_secret.as_deref() != Some(expected_secret) {
+        if !state.accepts_auth_method(method) {
+            return OAuthError::invalid_client(format!("{method} is not accepted here"))
+                .into_response();
+        }
+        if presented_secret != Some(expected_secret) {
             return OAuthError::invalid_client("missing or incorrect client_secret")
                 .into_response();
         }
@@ -208,7 +239,7 @@ fn sign_id_token(
     // knob for it in the spec's test-control surface, and access-token TTL
     // is the one the broker actually varies in its tests.
     let ttl = state.runtime_config().access_token_ttl_secs as i64;
-    state.signing_key.sign(&IdTokenClaims {
+    state.sign(&IdTokenClaims {
         iss: &state.base_url,
         sub: subject,
         aud: client_id,

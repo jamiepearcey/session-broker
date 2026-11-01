@@ -6,5 +6,6 @@ use serde_json::Value;
 use super::SharedState;
 
 pub async fn jwks(State(state): State<SharedState>) -> Json<Value> {
-    Json(state.signing_key.jwks_document())
+    state.record_jwks_call();
+    Json(state.jwks_document())
 }

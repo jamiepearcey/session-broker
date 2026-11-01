@@ -53,6 +53,7 @@ struct Stack {
     reader: Arc<Reader>,
     writer: Writer,
     clock: Arc<dyn Clock>,
+    test_clock: TestClock,
     /// Every response body the admin lane gave in this test.
     admin_bodies: Mutex<Vec<String>>,
     path: std::path::PathBuf,
@@ -76,7 +77,8 @@ impl Stack {
         let registry = Arc::new(registry);
         let metrics = crate::telemetry::Metrics::new();
         let audit = AuditSink::new(writer.handle(), metrics.clone(), AuditConfig::default());
-        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let test_clock = TestClock::new(T0);
+        let clock: Arc<dyn Clock> = Arc::new(test_clock.clone());
         let policy = SessionPolicy::default();
         let sessions = Arc::new(SessionMap::with_durability(policy, writer.handle()));
         let (schedule_tx, schedule_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -113,6 +115,7 @@ impl Stack {
             reader,
             writer,
             clock,
+            test_clock,
             admin_bodies: Mutex::default(),
             path,
         }
@@ -270,6 +273,164 @@ async fn refresh_calls(handle: &MockIdpHandle) -> u64 {
     state["counters"]["token_calls_by_grant"]["refresh_token"]
         .as_u64()
         .unwrap_or(0)
+}
+
+async fn counter(handle: &MockIdpHandle, name: &str) -> u64 {
+    let state: Value = reqwest::get(format!("{}/__test__/state", handle.base_url()))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    state["counters"][name].as_u64().unwrap()
+}
+
+async fn rotate_keys(handle: &MockIdpHandle, publish: bool) {
+    let response = reqwest::Client::new()
+        .post(format!("{}/__test__/rotate-keys", handle.base_url()))
+        .json(&json!({ "publish": publish }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+async fn idp_taking(methods: Option<&[&str]>) -> MockIdpHandle {
+    spawn_mock_idp(MockIdpConfig {
+        clients: vec![ClientConfig {
+            client_id: "client-a".to_owned(),
+            client_secret: Some(SECRET_A.to_owned()),
+            redirect_uris: vec![REDIRECT.to_owned()],
+        }],
+        token_auth_methods: methods.map(|m| m.iter().map(|s| (*s).to_owned()).collect()),
+        ..MockIdpConfig::default()
+    })
+    .await
+    .unwrap()
+}
+
+/// `/token` itself, authenticated the way a method says: the proof that the
+/// fixture really does refuse the other one.
+async fn token_status(handle: &MockIdpHandle, basic: bool) -> u16 {
+    let form = [("grant_type", "refresh_token"), ("refresh_token", "nope")];
+    let request = reqwest::Client::new().post(format!("{}/token", handle.base_url()));
+    let request = if basic {
+        request.basic_auth("client-a", Some(SECRET_A)).form(&form)
+    } else {
+        request.form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "nope"),
+            ("client_id", "client-a"),
+            ("client_secret", SECRET_A),
+        ])
+    };
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let body: Value = response.json().await.unwrap();
+    if status == 401 || body["error"] == "invalid_client" {
+        401
+    } else {
+        status
+    }
+}
+
+#[tokio::test]
+async fn code_exchange_and_refresh_both_use_the_method_the_provider_supports() {
+    for (methods, basic_ok, post_ok) in [
+        (Some(&["client_secret_basic"][..]), true, false),
+        (Some(&["client_secret_post"][..]), false, true),
+        (None, true, false), // absent: RFC 8414 says basic
+    ] {
+        let handle = idp_taking(methods).await;
+        // Past client authentication the refresh token is what gets refused.
+        assert_eq!(
+            token_status(&handle, true).await != 401,
+            basic_ok,
+            "{methods:?}"
+        );
+        assert_eq!(
+            token_status(&handle, false).await != 401,
+            post_ok,
+            "{methods:?}"
+        );
+
+        let stack = Stack::new(ProviderRegistry::empty(REDIRECT)).await;
+        stack.add("a", &handle, "client-a", SECRET_A).await;
+        let session = stack.sign_in("/auth/login?provider=a").await;
+        let session = session.unwrap_or_else(|e| panic!("{methods:?}: {e}"));
+        assert_eq!(stack.session_sub(&session).await, "a|user-1");
+
+        let outcome = stack
+            .upstream()
+            .refresh(&stack.custody_of("a|user-1"))
+            .await;
+        assert!(
+            matches!(outcome, RefreshOutcome::Success { .. }),
+            "{methods:?}: {outcome:?}"
+        );
+        // The real refresh, plus the two probes above.
+        assert_eq!(refresh_calls(&handle).await, 3, "{methods:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_login_survives_the_provider_rotating_its_keys_after_discovery() {
+    let a = idp("client-a", SECRET_A).await;
+    let stack = Stack::new(ProviderRegistry::empty(REDIRECT)).await;
+    stack.add("a", &a, "client-a", SECRET_A).await;
+    assert!(stack.sign_in("/auth/login?provider=a").await.is_ok());
+
+    let before = counter(&a, "jwks_calls").await;
+    assert!(
+        stack.sign_in("/auth/login?provider=a").await.is_ok(),
+        "with the key held, nothing is refetched"
+    );
+    assert_eq!(counter(&a, "jwks_calls").await, before);
+
+    rotate_keys(&a, true).await;
+    let session = stack.sign_in("/auth/login?provider=a").await.unwrap();
+    assert_eq!(stack.session_sub(&session).await, "a|user-1");
+    assert_eq!(counter(&a, "jwks_calls").await, before + 1);
+
+    // The new key is held now, so the next login fetches nothing.
+    assert!(stack.sign_in("/auth/login?provider=a").await.is_ok());
+    assert_eq!(counter(&a, "jwks_calls").await, before + 1);
+}
+
+#[tokio::test]
+async fn an_unknown_kid_is_refused_after_a_refetch_and_cannot_drive_more_of_them() {
+    let a = idp("client-a", SECRET_A).await;
+    let stack = Stack::new(ProviderRegistry::empty(REDIRECT)).await;
+    stack.add("a", &a, "client-a", SECRET_A).await;
+    let before = counter(&a, "jwks_calls").await;
+
+    // Signed with a key the IdP does not publish.
+    rotate_keys(&a, false).await;
+
+    let refused = stack.sign_in("/auth/login?provider=a").await.unwrap_err();
+    assert!(refused.contains("error=oauth_error"), "{refused}");
+    assert_eq!(counter(&a, "jwks_calls").await, before + 1, "one refetch");
+
+    for _ in 0..3 {
+        assert!(stack.sign_in("/auth/login?provider=a").await.is_err());
+    }
+    assert_eq!(counter(&a, "jwks_calls").await, before + 1, "rate limited");
+
+    // Just inside the window, still nothing. Past it, one more, per provider.
+    stack
+        .test_clock
+        .advance(crate::oauth::JWKS_REFETCH_MIN_INTERVAL_SECS - 1);
+    assert!(stack.sign_in("/auth/login?provider=a").await.is_err());
+    assert_eq!(counter(&a, "jwks_calls").await, before + 1);
+    stack.test_clock.advance(1);
+    assert!(stack.sign_in("/auth/login?provider=a").await.is_err());
+    assert_eq!(counter(&a, "jwks_calls").await, before + 2);
+
+    let held: i64 = stack.reader.with(|c| {
+        c.query_row("SELECT COUNT(*) FROM custody", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(held, 0, "no refused login took custody of anything");
 }
 
 async fn two_providers() -> (Stack, MockIdpHandle, MockIdpHandle) {
