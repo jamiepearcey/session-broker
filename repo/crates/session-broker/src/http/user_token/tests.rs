@@ -872,3 +872,108 @@ async fn no_token_or_cookie_reaches_the_log_or_a_metric() {
         assert!(!metrics.contains(needle), "{label} is in a metric");
     }
 }
+
+// --- the desktop handoff (ADR-0019) ---------------------------------------------------------------
+
+fn attempt_pair(seed: &str) -> (String, String) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let verifier = format!("verifier-{seed}-{:?}", std::time::SystemTime::now());
+    (URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())), verifier)
+}
+
+impl Harness {
+    async fn desktop(&self, attempt: &str, cookie: Option<&str>) -> StatusCode {
+        let mut request = Request::builder().uri(format!("/auth/desktop?attempt={attempt}"));
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, format!("__Host-broker_session={cookie}"));
+        }
+        self.send(request.body(Body::empty()).unwrap()).await.status()
+    }
+
+    async fn handoff(&self, attempt: &str, verifier: &str) -> (StatusCode, serde_json::Value) {
+        let response = self
+            .admin
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/desktop-handoff")
+                    .header("authorization", format!("Bearer {ADMIN_KEY}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "attempt": attempt, "verifier": verifier }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+}
+
+#[tokio::test]
+async fn a_desktop_sign_in_binds_a_token_that_redeems_exactly_once() {
+    let h = harness_with("desktop-ok", true, Some("qw-desktop"), SessionPolicy::default());
+    let (cookie, sid) = h.login("entra|alice");
+    let (attempt, verifier) = attempt_pair("ok");
+
+    let (status, before) = h.handoff(&attempt, &verifier).await;
+    assert_eq!((status, before["status"].as_str()), (StatusCode::OK, Some("pending")));
+
+    crate::http::desktop::note_login(&attempt, &sid, h.clock.now().secs());
+    assert_eq!(h.desktop(&attempt, Some(&cookie)).await, StatusCode::OK);
+
+    let (status, wrong) = h.handoff(&attempt, "not-the-verifier").await;
+    assert_eq!((status, wrong["error"].as_str()), (StatusCode::FORBIDDEN, Some("bad_verifier")));
+
+    let (status, answer) = h.handoff(&attempt, &verifier).await;
+    assert_eq!((status, answer["status"].as_str()), (StatusCode::OK, Some("complete")));
+    assert_eq!(answer["tenant"], "qw-desktop");
+    assert!(answer["access_token"].as_str().unwrap().split('.').count() == 3);
+
+    let (_, again) = h.handoff(&attempt, &verifier).await;
+    assert_eq!(again["status"], "pending", "one use: a second redeem finds nothing");
+}
+
+#[tokio::test]
+async fn the_desktop_page_refuses_no_session_and_a_session_this_attempt_did_not_make() {
+    let h = harness_with("desktop-refuse", true, Some("qw-desktop"), SessionPolicy::default());
+    let (attempt, verifier) = attempt_pair("refuse");
+    assert_eq!(h.desktop(&attempt, None).await, StatusCode::UNAUTHORIZED);
+
+    // Already signed in in this browser, but no login named this attempt: a link cannot spend that session.
+    let (cookie, _sid) = h.login("entra|alice");
+    assert_eq!(h.desktop(&attempt, Some(&cookie)).await, StatusCode::UNAUTHORIZED);
+    // A login for this attempt, but another session presented.
+    crate::http::desktop::note_login(&attempt, "another-sid", h.clock.now().secs());
+    assert_eq!(h.desktop(&attempt, Some(&cookie)).await, StatusCode::UNAUTHORIZED);
+
+    let (_, answer) = h.handoff(&attempt, &verifier).await;
+    assert_eq!(answer["status"], "pending");
+}
+
+#[tokio::test]
+async fn a_revoked_person_ends_the_attempt_with_the_reason_and_a_hint() {
+    let h = harness_with("desktop-denied", true, None, SessionPolicy::default());
+    let (cookie, sid) = h.login("entra|nobody");
+    let (attempt, verifier) = attempt_pair("denied");
+    crate::http::desktop::note_login(&attempt, &sid, h.clock.now().secs());
+    assert_eq!(h.desktop(&attempt, Some(&cookie)).await, StatusCode::FORBIDDEN);
+    let (_, answer) = h.handoff(&attempt, &verifier).await;
+    assert_eq!(answer["status"], "failed");
+    assert_eq!(answer["error"], "not_granted");
+    assert!(answer["hint"].as_str().unwrap().contains("grant"));
+}
+
+#[tokio::test]
+async fn an_unredeemed_outcome_expires() {
+    let h = harness_with("desktop-expiry", true, Some("qw-desktop"), SessionPolicy::default());
+    let (attempt, verifier) = attempt_pair("expiry");
+    let now = h.clock.now().secs();
+    crate::http::desktop::note_failure(&attempt, "exchange_failed", "boom", now);
+    assert!(crate::http::desktop::redeem(&attempt, now + crate::http::desktop::ATTEMPT_TTL_SECS).is_none());
+    let (_, answer) = h.handoff(&attempt, &verifier).await;
+    assert_eq!(answer["status"], "pending");
+}

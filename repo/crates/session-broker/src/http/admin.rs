@@ -39,6 +39,7 @@ use crate::session::SessionMap;
 use crate::store::{repo, writer::WriterHandle, Reader};
 use crate::telemetry::{LogControl, Metrics};
 
+mod handoff;
 mod identity;
 mod providers;
 
@@ -140,6 +141,7 @@ pub fn router(state: AdminState) -> Router {
                 .delete(providers::remove),
         )
         .route("/admin/providers/{id}/people", get(providers::people))
+        .route("/admin/desktop-handoff", post(handoff::redeem))
         .route("/admin/audit", get(list_audit))
         .route(
             "/admin/observability",

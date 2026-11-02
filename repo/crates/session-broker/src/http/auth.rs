@@ -31,7 +31,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use super::error::{ApiError, ErrorCode};
-use super::guards;
+use super::{desktop, guards};
 use super::{AppState, HttpConfig};
 use crate::clock::Timestamp;
 use crate::oauth::{random_id, OauthError, UpstreamTokens, DEFAULT_PROVIDER, TXN_TTL_SECS};
@@ -72,8 +72,8 @@ pub async fn providers(Extension(registry): Extension<Arc<ProviderRegistry>>) ->
         .into_response()
 }
 
-fn login_refusal(refusal: LoginRefusal) -> Response {
-    let (code, detail) = match refusal {
+fn refusal_words(refusal: LoginRefusal) -> (ErrorCode, String) {
+    match refusal {
         LoginRefusal::NoProviders => (
             ErrorCode::NoProviders,
             "No identity provider is enabled on this broker.".to_owned(),
@@ -97,8 +97,7 @@ fn login_refusal(refusal: LoginRefusal) -> Response {
                 format!("The identity provider could not be reached ({}).", failure.failure),
             )
         }
-    };
-    ApiError::new(code, detail).into_response()
+    }
 }
 
 /// `GET /auth/login?return_to=/path` — validates `return_to` (INV-4, via the
@@ -142,7 +141,15 @@ pub async fn login(
 
     let oidc = match registry.client_for_login(query.provider.as_deref()).await {
         Ok(oidc) => oidc,
-        Err(refusal) => return login_refusal(refusal),
+        Err(refusal) => {
+            let (code, detail) = refusal_words(refusal);
+            // A desktop sign-in is waiting in the app, which should hear this too.
+            if let Some(attempt) = desktop::attempt_of(return_to.as_deref()) {
+                let name = serde_json::to_value(code).ok().and_then(|v| v.as_str().map(str::to_owned));
+                desktop::note_failure(attempt, name.as_deref().unwrap_or("error"), &detail, state.clock.now().secs());
+            }
+            return ApiError::new(code, detail).into_response();
+        }
     };
 
     let now = state.clock.now();
@@ -190,14 +197,21 @@ pub async fn callback(
             record_login_failure(&state, "no_txn_cookie", now);
             error_redirect(&state.config, "no_txn_cookie", "The browser sent no sign-in cookie with this response.")
         }
-        Some(id) => match resolve(&registry, id, &query, now).await {
-            Ok((tokens, return_to)) => success_response(&state, tokens, return_to, now),
-            Err(error) => {
-                tracing::warn!(%error, "oauth callback failed");
-                record_login_failure(&state, error.code(), now);
-                error_redirect(&state.config, error.code(), &error.to_string())
+        Some(id) => {
+            // Read before `resolve` consumes the txn: a failed desktop sign-in has an app waiting for the answer.
+            let txn_return_to = registry.txn_return_to(id);
+            match resolve(&registry, id, &query, now).await {
+                Ok((tokens, return_to)) => success_response(&state, tokens, return_to, now),
+                Err(error) => {
+                    tracing::warn!(%error, "oauth callback failed");
+                    record_login_failure(&state, error.code(), now);
+                    if let Some(attempt) = desktop::attempt_of(txn_return_to.as_deref()) {
+                        desktop::note_failure(attempt, error.code(), &error.to_string(), now.secs());
+                    }
+                    error_redirect(&state.config, error.code(), &error.to_string())
+                }
             }
-        },
+        }
     };
 
     // The txn cookie's job ends here regardless of outcome: expire it so a
@@ -287,6 +301,9 @@ fn success_response(
         };
         if let Err(e) = sink.take_custody(&custody, &grant, now) {
             tracing::error!(error = %e, "could not take custody of the upstream grant; refusing the login");
+            if let Some(attempt) = desktop::attempt_of(return_to.as_deref()) {
+                desktop::note_failure(attempt, "custody_failed", "The broker could not store the sign-in in its own database.", now.secs());
+            }
             return error_redirect(
                 &state.config,
                 "custody_failed",
@@ -298,6 +315,9 @@ fn success_response(
     let issued = state
         .sessions
         .create(sid.clone(), custody.clone(), tokens.sub.clone(), now);
+    if let Some(attempt) = desktop::attempt_of(return_to.as_deref()) {
+        desktop::note_login(attempt, &sid.0, now.secs());
+    }
 
     if let Some(sink) = &state.audit {
         sink.record(
@@ -388,7 +408,7 @@ fn failures() -> &'static std::sync::Mutex<std::collections::VecDeque<Failure>> 
 }
 
 /// What to do about a failure, by the provider's own code where it has a known fix.
-fn failure_hint(code: &str, detail: &str) -> &'static str {
+pub(super) fn failure_hint(code: &str, detail: &str) -> &'static str {
     const BY_DETAIL: &[(&str, &str)] = &[
         ("AADSTS7000215", "Entra rejected the client secret. Save the secret's Value, not its Secret ID, in Admin > Authentication."),
         ("AADSTS7000222", "The client secret has expired. Create a new one in Entra and save its Value in Admin > Authentication."),
@@ -405,6 +425,7 @@ fn failure_hint(code: &str, detail: &str) -> &'static str {
     }
     match code {
         "no_txn_cookie" | "unknown_txn" => "This sign-in attempt was not found. Start again from the sign-in link, in one browser and on one host name (localhost and 127.0.0.1 hold separate cookies).",
+        "not_granted" => "This person signed in but holds no grant here. An administrator can grant a role in Admin > Authentication.",
         "txn_expired" => "This sign-in attempt took too long. Start again.",
         "state_mismatch" | "iss_mismatch" => "This response does not belong to the sign-in that was started. Start again; if it repeats, tell an administrator.",
         "invalid_id_token" => "The provider's identity token failed verification. Check the issuer and client ID, and the machine's clock.",
@@ -413,7 +434,7 @@ fn failure_hint(code: &str, detail: &str) -> &'static str {
     }
 }
 
-fn escape_html(text: &str) -> String {
+pub(super) fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
@@ -751,6 +772,30 @@ mod tests {
             "the replay must not mint a second session"
         );
 
+        h.shutdown().await;
+    }
+
+    // --- the desktop handoff --------------------------------------------------
+
+    #[tokio::test]
+    async fn a_failed_desktop_login_reaches_the_app_with_the_providers_words() {
+        let h = Harness::new().await;
+        let attempt = "a".repeat(43);
+        let login_response = h
+            .send(get(format!("/auth/login?return_to=%2Fauth%2Fdesktop%3Fattempt%3D{attempt}")))
+            .await;
+        let txn_cookie = set_cookie_named(&login_response, "__Host-broker_txn").expect("txn cookie set");
+        let response = h
+            .send(get_with_cookie("/auth/callback?error=access_denied".to_owned(), &txn_cookie))
+            .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        match desktop::redeem(&attempt, T0.secs()) {
+            Some(desktop::Outcome::Failed { detail, hint, .. }) => {
+                assert!(detail.contains("access_denied"));
+                assert!(hint.contains("declined"));
+            }
+            other => panic!("expected the failure, got {other:?}"),
+        }
         h.shutdown().await;
     }
 

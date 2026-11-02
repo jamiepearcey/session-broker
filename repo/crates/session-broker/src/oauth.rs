@@ -250,6 +250,11 @@ impl TxnStore {
         self.txns.get(id).map(|r| r.provider_id.clone())
     }
 
+    /// Where a presented txn's login is headed. Reads only, like `provider_of`.
+    pub(crate) fn return_to_of(&self, id: &str) -> Option<String> {
+        self.txns.get(id).and_then(|r| r.return_to.clone())
+    }
+
     /// See [`OidcClient::discard_txn`].
     pub(crate) fn discard(&self, id: &str) {
         self.take(id);

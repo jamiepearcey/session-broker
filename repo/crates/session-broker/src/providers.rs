@@ -504,6 +504,11 @@ impl ProviderRegistry {
         self.txns.provider_of(txn_id)
     }
 
+    /// Where a txn's login is headed, read without consuming it.
+    pub fn txn_return_to(&self, txn_id: &str) -> Option<String> {
+        self.txns.return_to_of(txn_id)
+    }
+
     pub fn discard_txn(&self, txn_id: &str) {
         self.txns.discard(txn_id);
     }

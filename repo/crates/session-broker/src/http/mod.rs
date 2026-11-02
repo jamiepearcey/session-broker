@@ -18,6 +18,7 @@ use crate::session::{IssuedCookies, SessionMap, SessionMeta, SessionPolicy};
 pub mod admin;
 pub mod auth;
 pub mod authz;
+pub mod desktop;
 pub mod error;
 pub mod events;
 pub mod guards;
@@ -263,6 +264,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/providers", get(auth::providers))
         .route("/error", get(auth::error_page))
         .route("/auth/login", get(auth::login))
+        .route("/auth/desktop", get(desktop::desktop))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/token", post(token::issue))
         .route("/session/token", post(user_token::issue))

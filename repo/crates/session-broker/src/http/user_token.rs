@@ -43,7 +43,7 @@ use crate::session::Resolution;
 use crate::token::TokenHash;
 
 /// The metric's `kind` label.
-const KIND: &str = "user";
+pub(super) const KIND: &str = "user";
 
 #[derive(Deserialize)]
 struct Request {
@@ -68,19 +68,19 @@ struct Claims<'a> {
 }
 
 #[derive(Serialize)]
-struct Granted {
-    access_token: String,
+pub(super) struct Granted {
+    pub(super) access_token: String,
     token_type: &'static str,
-    expires_in: u64,
-    tenant: String,
-    roles: Vec<String>,
+    pub(super) expires_in: u64,
+    pub(super) tenant: String,
+    pub(super) roles: Vec<String>,
     indexes: Vec<String>,
 }
 
 /// What is known about the caller by the time the attempt ends, for the audit
 /// row. Filled in as the checks pass.
 #[derive(Default)]
-struct Attempt {
+pub(super) struct Attempt {
     sub: Option<String>,
     sid: Option<String>,
     issued: Option<IssuedFacts>,
@@ -109,30 +109,7 @@ pub async fn issue(State(state): State<AppState>, headers: HeaderMap, body: Byte
     match issue_inner(&state, handle, &headers, &body, &mut attempt) {
         Ok(granted) => {
             state.metrics.record_token_issued(KIND, "issued");
-            if let (Some(sink), Some(sub), Some(facts)) =
-                (&state.audit, &attempt.sub, &attempt.issued)
-            {
-                // Coalesced per (subject, audience), like machine issuance:
-                // the fact worth keeping is that this user was drawing tokens
-                // this afternoon, not each one. Refusals are never coalesced.
-                if sink.should_record_issuance(sub, &facts.audience, now) {
-                    let mut event =
-                        Event::new(action::TOKEN_ISSUED, Outcome::Success, ActorKind::User, now)
-                            .subject(sub.clone())
-                            .detail(serde_json::json!({
-                                "aud": facts.audience,
-                                "kind": KIND,
-                                "tenant": facts.tenant,
-                                "kid": facts.kid,
-                                "jti": facts.jti,
-                                "ttl": facts.ttl,
-                            }));
-                    if let Some(sid) = &attempt.sid {
-                        event = event.sid(sid.clone());
-                    }
-                    sink.record(event);
-                }
-            }
+            audit_issued(&state, &attempt, now);
             (
                 StatusCode::OK,
                 [
@@ -149,30 +126,53 @@ pub async fn issue(State(state): State<AppState>, headers: HeaderMap, body: Byte
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .unwrap_or_else(|| "error".to_owned());
             state.metrics.record_token_issued(KIND, &code);
-            // Recorded once there is a signed-in user to put in the row: a
-            // forged request or a dead cookie is counted above and no more.
-            // `unavailable` is the broker's own fault and is in the log.
-            if let (Some(sink), Some(sub), false) = (
-                &state.audit,
-                &attempt.sub,
-                err.error == ErrorCode::Unavailable,
-            ) {
-                let mut event = Event::new(
-                    action::TOKEN_ISSUANCE_REFUSED,
-                    Outcome::Failure,
-                    ActorKind::User,
-                    now,
-                )
-                .subject(sub.clone())
-                .reason(code);
-                if let Some(sid) = &attempt.sid {
-                    event = event.sid(sid.clone());
-                }
-                sink.record(event);
-            }
+            audit_refused(&state, &attempt, &code, now);
             err.into_response()
         }
     }
+}
+
+/// Coalesced per (subject, audience), like machine issuance: the fact worth keeping
+/// is that this user was drawing tokens this afternoon, not each one.
+pub(super) fn audit_issued(state: &AppState, attempt: &Attempt, now: crate::clock::Timestamp) {
+    let (Some(sink), Some(sub), Some(facts)) = (&state.audit, &attempt.sub, &attempt.issued) else {
+        return;
+    };
+    if sink.should_record_issuance(sub, &facts.audience, now) {
+        let mut event = Event::new(action::TOKEN_ISSUED, Outcome::Success, ActorKind::User, now)
+            .subject(sub.clone())
+            .detail(serde_json::json!({
+                "aud": facts.audience,
+                "kind": KIND,
+                "tenant": facts.tenant,
+                "kid": facts.kid,
+                "jti": facts.jti,
+                "ttl": facts.ttl,
+            }));
+        if let Some(sid) = &attempt.sid {
+            event = event.sid(sid.clone());
+        }
+        sink.record(event);
+    }
+}
+
+/// Recorded once there is a signed-in user to put in the row: a forged request or a
+/// dead cookie is counted and no more. `unavailable` is the broker's own fault and
+/// is in the log. Refusals are never coalesced.
+pub(super) fn audit_refused(state: &AppState, attempt: &Attempt, code: &str, now: crate::clock::Timestamp) {
+    let (Some(sink), Some(sub)) = (&state.audit, &attempt.sub) else {
+        return;
+    };
+    if code == "unavailable" {
+        return;
+    }
+    let mut event = Event::new(action::TOKEN_ISSUANCE_REFUSED, Outcome::Failure, ActorKind::User, now)
+        .subject(sub.clone())
+        .reason(code.to_owned());
+    if let Some(sid) = &attempt.sid {
+        event = event.sid(sid.clone());
+    }
+    sink.record(event);
 }
 
 fn issue_inner(
@@ -212,8 +212,23 @@ fn issue_inner(
             "the body must be JSON: {\"audience\": \"...\", \"tenant\": \"...\"}",
         )
     })?;
+    mint(state, handle, &meta, request.audience, request.tenant, attempt)
+}
+
+/// What the session's subject may have, signed. The caller has already proved the session.
+pub(super) fn mint(
+    state: &AppState,
+    handle: &IssuerHandle,
+    meta: &crate::session::SessionMeta,
+    audience: String,
+    asked_tenant: Option<String>,
+    attempt: &mut Attempt,
+) -> Result<Granted, ApiError> {
+    attempt.sub = Some(meta.sub.clone());
+    attempt.sid = Some(meta.sid.clone());
+    let now = state.clock.now();
     let config = &handle.config;
-    if !config.audiences.contains(&request.audience) {
+    if !config.audiences.contains(&audience) {
         return Err(ApiError::new(
             ErrorCode::BadAudience,
             "this issuer does not issue tokens for that audience",
@@ -227,7 +242,7 @@ fn issue_inner(
     })?;
     let (tenant, roles, indexes) = if grants.live.is_empty() && !grants.any_row {
         // Never granted anything: the install's default, if it has one.
-        match (&config.default_user_tenant, &request.tenant) {
+        match (&config.default_user_tenant, &asked_tenant) {
             (Some(default), asked) if asked.as_deref().is_none_or(|t| t == default) => {
                 // The default is a grant the install makes for the user; a
                 // tenant the operator disabled grants nothing.
@@ -247,7 +262,7 @@ fn issue_inner(
             _ => return Err(not_granted()),
         }
     } else {
-        let chosen = match request.tenant.as_deref() {
+        let chosen = match asked_tenant.as_deref() {
             Some(asked) => grants.live.iter().find(|g| g.tenant_id == asked),
             None => match grants.live.as_slice() {
                 [only] => Some(only),
@@ -282,7 +297,7 @@ fn issue_inner(
         iss: &config.issuer,
         sub: &meta.sub,
         sid: &meta.sid,
-        aud: &request.audience,
+        aud: &audience,
         exp: now.plus_secs(ttl).secs(),
         iat: now.secs(),
         jti: &jti,
@@ -297,7 +312,7 @@ fn issue_inner(
     })?;
 
     attempt.issued = Some(IssuedFacts {
-        audience: request.audience,
+        audience,
         tenant: tenant.clone(),
         kid,
         jti,
