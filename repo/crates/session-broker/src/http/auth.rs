@@ -287,7 +287,11 @@ fn success_response(
         };
         if let Err(e) = sink.take_custody(&custody, &grant, now) {
             tracing::error!(error = %e, "could not take custody of the upstream grant; refusing the login");
-            return error_redirect(&state.config);
+            return error_redirect(
+                &state.config,
+                "custody_failed",
+                "The broker could not store the sign-in in its own database. Nothing is wrong at the provider; check the broker log.",
+            );
         }
     }
 
@@ -363,7 +367,7 @@ fn error_redirect(config: &HttpConfig, code: &str, detail: &str) -> Response {
         detail: detail.chars().take(800).collect(),
     });
     drop(held);
-    redirect(&format!("{}/error?ref={reference}", config.origin()))
+    redirect(&format!("{}/error?error=oauth_error&ref={reference}", config.origin()))
 }
 
 /// What a failed sign-in said, for the page it lands on. The page reads it by an
